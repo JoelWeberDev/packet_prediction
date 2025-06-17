@@ -6,5 +6,8 @@ from typing import Iterable
 
 
 s = "Always work hard no matter the reward"
+s2 = "The leaves that blow in the wind get nowhere"
 
-print(s[0:0])
+arr = np.array([[], []])
+
+print(arr.size)

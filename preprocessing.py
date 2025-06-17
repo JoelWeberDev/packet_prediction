@@ -142,6 +142,7 @@ def get_column_types() -> Dict[str, type]:
     @Returns: Dictionary mapping column names to their types
     """
     return {
+        "frame.number": int,
         "frame.time_delta": float,
         "frame.time": str,
         "frame.time_epoch": float,
@@ -278,6 +279,44 @@ def extract_features(
     return ret_vals
 
 
+def payload_deltas(trans_df: pd.DataFrame) -> Dict[str, np.ndarray]:
+    """
+    @Description: Here we obtain the deltas between the payloads between
+    sequential transmissions.
+
+    @Notes:
+
+    @Returns:
+    """
+    deltas_len = max(0, len(trans_df) - 1)
+    deltas = {
+        "deltas": np.zeros(deltas_len, dtype=np.float32),
+        "perc_deltas": np.zeros(deltas_len, dtype=np.float32),
+    }
+
+    # ensure the dataframe is sorted by frame number
+    trans_df.sort_values("frame.number")
+
+    for i in range(deltas_len):
+        pkg1 = trans_df.iloc[i][PAYLOAD_TAG]
+        pkg2 = trans_df.iloc[i + 1][PAYLOAD_TAG]
+        delta = abs(len(pkg1) - len(pkg2))
+
+        for v1, v2 in zip(pkg1, pkg2):
+            if v1 != v2:
+                delta += 1
+
+        if max(len(pkg1), len(pkg2)) != 0:
+            perc_delta = delta / max(len(pkg1), len(pkg2))
+        else:
+            perc_delta = 0
+
+        deltas["deltas"][i] = delta
+        deltas["perc_deltas"][i] = perc_delta
+
+    return deltas
+
+
 if __name__ == "__main__":
 
     csv_path = "test_data/legtimate_w1-0.csv"
@@ -294,15 +333,15 @@ if __name__ == "__main__":
     print(df.info())
     print(df.describe())
 
-    ret_vals = extract_features(df)
-    for key, value_list in ret_vals.items():
-        value = value_list["value"]
-        if isinstance(value, list):
-            print(f"{key}: {len(value)}")
-        else:
-            print(
-                f"{key}: {value.shape}, first: {value[0]} max: {value.max()}, min: {value.min()}"
-            )
+    # ret_vals = extract_features(df)
+    # for key, value_list in ret_vals.items():
+    #     value = value_list["value"]
+    #     if isinstance(value, list):
+    #         print(f"{key}: {len(value)}")
+    #     else:
+    #         print(
+    #             f"{key}: {value.shape}, first: {value[0]} max: {value.max()}, min: {value.min()}"
+    #         )
 
     ### testing functions ###
     def ips_count(df):
@@ -340,3 +379,79 @@ if __name__ == "__main__":
             print(f"{hex(bt)}, {test_bytes[2 * i : 2 * (i + 1)]}")
 
     # test_bs()
+
+    # Considering packet deltas #
+    def view_packet_deltas(df: pd.DataFrame):
+        """
+        @Description: This takes conversation data frame and plots the
+        packet deltas that each device sends to the other device. We would like
+        to know how similar each transmission is.
+
+        @Notes:
+            - We break the df into directional tranmission from one ip to another
+
+        @Returns:
+        """
+        # Get all the ips in the df
+        ips = list(col_values_set(df, SRC_IP_TAG).keys())
+
+        trans_dirs = dict()
+
+        print(len(ips))
+
+        while len(ips) > 0:
+            ip1 = ips.pop()
+            for ip2 in ips:
+                trans_dirs[f"{ip1} -> {ip2}"] = df[
+                    (df[SRC_IP_TAG] == ip1) & (df[DST_IP_TAG] == ip2)
+                ]
+                trans_dirs[f"{ip2} -> {ip1}"] = df[
+                    (df[SRC_IP_TAG] == ip2) & (df[DST_IP_TAG] == ip1)
+                ]
+
+        # Now go through each df and find the deltas
+        cum_deltas = list()
+        cum_perc_deltas = list()
+
+        for dir, trans_df in trans_dirs.items():
+            abs_deltas, perc_deltas = payload_deltas(trans_df).values()
+
+            if abs_deltas.size != 0:
+                cum_deltas += abs_deltas.tolist()
+                cum_perc_deltas += perc_deltas.tolist()
+
+                # now plot and show the histogram of absolute deltas and percent deltas
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                ax1.hist(abs_deltas, bins=10)
+                ax1.set_title("Absolute deltas")
+                ax1.set_xlabel("Delta value")
+                ax1.set_ylabel("Frequency")
+
+                ax2.hist(perc_deltas, bins=10)
+                ax2.set_title("Percentage deltas")
+                ax2.set_xlabel("Delta percentages")
+                ax2.set_ylabel("Frequency")
+
+                fig.suptitle(f"Packet payload deltas {dir}")
+
+                plt.tight_layout()
+                plt.show()
+
+        # Now create one entire plot
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        ax1.hist(cum_deltas, bins=10)
+        ax1.set_title("Absolute deltas")
+        ax1.set_xlabel("Delta value")
+        ax1.set_ylabel("Frequency")
+
+        ax2.hist(cum_perc_deltas, bins=10)
+        ax2.set_title("Percentage deltas")
+        ax2.set_xlabel("Delta percentages")
+        ax2.set_ylabel("Frequency")
+
+        fig.suptitle(f"Cumulative packet deltas")
+
+        plt.tight_layout()
+        plt.show()
+
+    # view_packet_deltas(df)

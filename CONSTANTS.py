@@ -19,6 +19,7 @@ import numpy as np
 ### global definitions ###
 SRC_IP_TAG = "ip.src"
 DST_IP_TAG = "ip.dst"
+PAYLOAD_TAG = "tcp.payload"
 
 MAX_DF_ROWS = 100000
 

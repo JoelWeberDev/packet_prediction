@@ -44,3 +44,6 @@ def plot_bar(data, **kwargs):
         raise Exception(f"Data type {type(data)} is not supported")
 
     plt.show()
+
+
+### Visualizations ###

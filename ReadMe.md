@@ -16,8 +16,22 @@
 
 ## Simulations to do
     - Payload similarity between conversations
-    - Auto correlation of packet lengths
+    - Auto correlation of packet lengths plot
+    - Compare packet length and similarity
     - Plot of sensor data observations
+    - Get a plot of the packet deltas between each time
+
+## Dimensions and embeddings
+    - Recall that the objective is to predict the next byte in the packet sequence given a historica context of packet payloads and metadata. Since we are operating at the byte level we will have a volcabulary size of of 256.
+    - This LSTM model will be multimodal meaning that along with the desired output, bytes it will allows for additional inputs such as:
+        - frame.number (1 dim)
+        - frame.time_delta (1 dim)
+        - Past compresstion ratio **(future addition)** (1 dim)
+        - mqtt.hdrcmd (dim 2^4 = 16)
+        - mqtt.hdrflgs (dim 4)
+        - mqtt.len (1 dim)
+        - flow.direction (broker -> client = 0, client -> broker = 1) (1 dim)
+        -  
         
 ## Model training
     - We are using an LSTM model because the data in a conversation is highly recurrent. Hence we need "memeory" of the past. Recurrent neural networks establish a running history of past data observed having an effect of autocorrelation. 
@@ -26,5 +40,3 @@
     - We will predict the data in a byte by byte format rather than attempting to do everything in a single shot.
     - Since we are operating at the byte by byte level we can limit the volcabulary to a mere 256 different possiblities. This makes the processing and size of the model very tractable.
     - For each different conversation we will need to use and store a different activation.
-
-### 

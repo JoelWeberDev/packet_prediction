@@ -163,9 +163,124 @@ def get_column_types() -> Dict[str, type]:
     }
 
 
+def extract_features(
+    df: pd.DataFrame, inplace: bool = True
+) -> Dict[str, Dict[str, np.ndarray | List]]:
+    """
+    @Description:
+        - Here is the list of features that we will extract or create from the dataframe
+            - sequences
+            - mqtt message length
+            - mqtt hdr flags
+            - frame.time
+            - frame.number
+            - frame.time_delta ??
+            - flow direction
+            - conversation number
+    @Return: Dict[str, List]
+        - The dictionary contains all the afore mentioned columns as lists where each entry
+        in the list corresponds to a row.
+    """
+
+    # Ensure that the data set has all the features that we need
+    req_features = [
+        "ip.src",
+        "ip.dst",
+        "mqtt.hdrflags",
+        "mqtt.len",
+        "tcp.payload",
+        "frame.number",
+        "frame.time_delta",
+    ]
+
+    for colname in req_features:
+        assert colname in df.keys(), f"The column name {colname} not found in dataframe"
+
+    ic("processing data frame ...")
+    if inplace:
+        df = df.copy(deep=True)
+
+    n_rows = len(df)
+    ret_vals = {
+        "frame.number": {
+            "dtype": "numerical",
+            "value": np.array(df["frame.number"]),
+        },  # numerical
+        "frame.time_delta": {
+            "dtype": "numerical",
+            "value": np.array(df["frame.time_delta"]),
+        },  # numerical
+        "mqtt.len": {
+            "dtype": "numerical",
+            "value": np.array(df["mqtt.len"]),
+        },  # numerical
+        "mqtt.hdrcmd": {
+            "dtype": "categorical",
+            "value": np.zeros(n_rows, dtype=np.uint8),
+        },  # first 4 bits of header byte categorical
+        "mqtt.hdrflags": {
+            "dtype": "categorical",
+            "value": np.zeros(n_rows, dtype=np.uint8),
+        },  # last 4 bits of header byte categorical
+        "flow.direction": {
+            "dtype": "categorical",
+            "value": np.zeros(n_rows, dtype=np.uint8),  # categorical
+        },  # flow direction classification based ips
+        "conv.number": {
+            "dtype": "categorical",
+            "value": np.zeros(n_rows, dtype=np.uint8),  # categorical
+        },  # unique number assiged to each conversation
+        "mqtt.msg": {
+            "dtype": "sequential",
+            "value": list(),
+        },  # Actual data within the mqtt message. Our whole objective
+    }
+
+    # Now convert add a row of conversation number where we assign each conversation between 2
+    # communicating devices a specific number. There are choose(n_ips, 2) possible converation numbers
+    ips = list(col_values_set(df, "ip.src").keys())
+    conv_n = 1
+
+    while len(ips) > 0:
+        ip1 = ips.pop()
+        for ip2 in ips:
+            # Get an index map of all the rows includeing the 2 ips
+            ind_mask = conversation_filter(df, ip1, ip2, ret_inds=True)
+            if len(df.loc[ind_mask]) > 0:
+                ret_vals["conv.number"]["value"][ind_mask] = conv_n
+                conv_n += 1
+
+    # Add the directionality conversation flag to each conversation where
+    # client -> client = 0 broker -> client = 1, client -> broker = 2
+    ret_vals["flow.direction"]["value"][df["ip.src"] == IP_DICT["broker"]] = 1
+    ret_vals["flow.direction"]["value"][df["ip.dst"] == IP_DICT["broker"]] = 2
+
+    # Now parse the mqtt header into commads (first 4 bits) and flags (last 4 bits)
+    for i, mqtt_hdr in enumerate(df["mqtt.hdrflags"]):
+        # Split the header byte in half
+        val = int(mqtt_hdr, 16)  # the value is in the for "0xFF"
+        ret_vals["mqtt.hdrcmd"]["value"][i] = (val & 0b11110000) // 16
+        ret_vals["mqtt.hdrflags"]["value"][i] = val & 0b00001111
+
+    # Convert each data payload into a numpy array of bytes
+    # this is the raw byte data of the mqtt msg. We remove the fixed header
+    # which always includes a byte for the flags and then 1 - 4 bytes for the
+    # msg length.
+    ret_vals["mqtt.msg"]["value"] = list(
+        [
+            np.array(get_byte_list(byte_str)[-1 * mqtt_len :], dtype=np.uint8)
+            for mqtt_len, byte_str in zip(df["mqtt.len"], df["tcp.payload"])
+        ]
+    )
+
+    ic("done processing data frame ...")
+
+    return ret_vals
+
+
 if __name__ == "__main__":
 
-    csv_path = "/home/joel/Documents/laurier/URSA/research/datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-0.csv"
+    csv_path = "test_data/legtimate_w1-0.csv"
 
     df = pd.read_csv(
         csv_path,
@@ -179,46 +294,15 @@ if __name__ == "__main__":
     print(df.info())
     print(df.describe())
 
-    ### data preprocessing ###
-    ic("processing data frame ...")
-    # Convert the time into a date time
-    df["frame.time"] = pd.to_datetime(
-        df["frame.time"].str.replace("EDT", "").str.strip(),
-        format="%b %d, %Y %H:%M:%S.%f",
-        errors="coerce",
-    )
-    df["frame.time"] = df["frame.time"].dt.tz_localize("America/New_York")
-    # print(df["frame.time"].head())
-
-    # Now convert add a row of conversation number where we assign each conversation between 2
-    # communicating devices a specific number. There are choose(n_ips, 2) possible converation numbers
-    ips = list(col_values_set(df, "ip.src").keys())
-    conv_n = 1
-    df["conv.n"] = np.zeros(len(df), np.int32)
-
-    while len(ips) > 0:
-        ip1 = ips.pop()
-        for ip2 in ips:
-            # Get an index map of all the rows includeing the 2 ips
-            ind_mask = conversation_filter(df, ip1, ip2, ret_inds=True)
-            if len(df.loc[ind_mask]) > 0:
-                df.loc[ind_mask, "conv.n"] = conv_n
-                conv_n += 1
-
-    # Convert each data payload into a numpy array of bytes
-    # this is the raw byte data of the mqtt msg. We remove the fixed header
-    # which always includes a byte for the flags and then 1 - 4 bytes for the
-    # msg length. Since
-    df["mqtt.msg"] = list(
-        [
-            np.array(get_byte_list(byte_str)[-1 * mqtt_len :], dtype=np.uint8)
-            for mqtt_len, byte_str in zip(df["mqtt.len"], df["tcp.payload"])
-        ]
-    )
-
-    ic("done processing data frame ...")
-
-    ### Actual model traing ###
+    ret_vals = extract_features(df)
+    for key, value_list in ret_vals.items():
+        value = value_list["value"]
+        if isinstance(value, list):
+            print(f"{key}: {len(value)}")
+        else:
+            print(
+                f"{key}: {value.shape}, first: {value[0]} max: {value.max()}, min: {value.min()}"
+            )
 
     ### testing functions ###
     def ips_count(df):
@@ -228,22 +312,8 @@ if __name__ == "__main__":
             print(f"{key}: {item.count}")
 
     def test_conversation_filter(df):
-        ip_dict = {
-            "broker": "10.16.100.73",
-            "smoke": "192.168.0.180",
-            "lock": "192.168.0.176",
-            "co-gas": "192.168.0.155",
-            "motion1": "192.168.0.154",
-            "motion2": "192.168.0.174",
-            "temp": "192.168.0.151",
-            "humidity": "192.168.0.152",
-            "fan": "192.168.0.178",
-            "fan_spd": "192.168.0.173",
-            "light": "192.168.0.150",
-        }
-
         # get the broker and the  CO gas sensor
-        conv_df = conversation_filter(df, ip_dict["broker"], ip_dict["co-gas"])
+        conv_df = conversation_filter(df, IP_DICT["broker"], IP_DICT["co-gas"])
 
         print(f"totol packets: {len(conv_df)}")
 

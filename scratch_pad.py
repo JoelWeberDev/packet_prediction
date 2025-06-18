@@ -8,6 +8,7 @@ from typing import Iterable
 s = "Always work hard no matter the reward"
 s2 = "The leaves that blow in the wind get nowhere"
 
-arr = np.array([[], []])
+l = list()
 
-print(arr.size)
+l = l + [0] * 10
+print(l)

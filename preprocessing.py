@@ -166,7 +166,7 @@ def get_column_types() -> Dict[str, type]:
 
 def extract_features(
     df: pd.DataFrame, inplace: bool = True
-) -> Dict[str, Dict[str, Union[np.ndarray, List, str | int]]]:
+) -> Dict[str, Dict[str, Union[np.ndarray, List, str, int]]]:
     """
     @Description:
         - Here is the list of features that we will extract or create from the dataframe

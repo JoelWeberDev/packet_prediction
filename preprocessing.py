@@ -24,14 +24,7 @@ noted that in most packets most headings are blank (having no value at all).
         mqtt.willtopic,mqtt.willtopic_len,ip.proto
 
 @TODO
-    - Creation of pandas data frames
-    - Simply read a csv dataset
-    - Create methods to filter for the following things (return new dataframe)
-        - Packets with specific value(s) for a certain header
-        - Packets with non trivial values for specific header
-        - Conversation filter
-        - Timestamp range filter
-    -
+    - 
 
 """
 

@@ -5,11 +5,16 @@
 to be learned from. This includes various predictive model implementations
 along with some huristics to test and score the models
 
+Each of the packets needs to be divided into packets with a contextual history.
+For each trainging point we need the history, packet metadata, and the payload with which
+to compare it to.
+
 @Notes:
     - Here is a list of what features
 
 
 @TODO:
+
 """
 
 # Library imports
@@ -21,11 +26,90 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Tuple, List, Optional, Iterator
+from dataclasses import dataclass
 from icecream import ic
 
 # Local imports
 from CONSTANTS import *
 from preprocessing import extract_features, split_into_conversations
+
+
+### Custom data structures ###
+@dataclass
+class SeqInput:
+    input_bytes: torch.Tensor
+    attention_mask: torch.Tensor
+    input_len: int
+
+
+@dataclass
+class ParsedPacket:
+    padded_payload: SeqInput
+    cat_features: torch.Tensor
+    numerical_features: torch.Tensor
+
+
+@dataclass
+class PacketWithContext:
+    context: List[ParsedPacket]
+    target: ParsedPacket
+
+
+class HistoryQueue:
+    """
+    @Description: Stores the packet history for the model training in a memory
+    safe way that drops the oldest packet once the max size is exceeded. Internally
+    this is implemented using a circular structure and start / end pointers
+
+    @Notes:
+        - Removal is not implemented because it is not needed
+
+    """
+
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.data = list()
+        self.first = 0  # first in
+        self.last = 0  # last in
+
+    def append(self, value):
+        if len(self) == self.max_size:
+            # replace the value at start
+            self.data[self.first] = value
+
+            self.first = self.inc_ptr(self.first)
+            self.last = self.inc_ptr(self.last)
+
+        else:
+            self.data.append(value)
+            self.last = self.inc_ptr(self.last)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            # Handle slicing (e.g., queue[1:5])
+            start = idx.start if idx.start is not None else 0
+            start = max(-1 * len(self), start)
+            start = min(len(self), start) % len(self)
+
+            stop = idx.stop if idx.stop is not None else len(self)
+            stop = max(-1 * len(self), stop)
+            stop = min(len(self), stop) % (len(self) + 1)
+
+            step = idx.step if idx.step is not None else 1
+            return [
+                self.data[(self.first + i) % len(self)]
+                for i in range(start, stop, step)
+            ]
+        else:
+            # Handle single index (e.g., queue[1])
+            return self.data[(self.first + idx) % len(self)]
+
+    ### Helper functions ###
+    def inc_ptr(self, val: int) -> int:
+        return (val + 1) % len(self)
 
 
 ### Byte sequence dataset ###
@@ -40,54 +124,52 @@ class PacketDataset(Dataset):
         must be married into the same framework
         - This returns an iterator that so that the results can be used on demand rather than being
         stored all in memory.
+        Categoical feature structure follows the format:
+            [mqtt.hdrcmd, mqtt.hdrflags, flow.direction, conv.number]
+        Numerical feature structure:
+            [frame.number, frame.time_delta, mqtt.len]
     """
 
-    def __init__(self, df: pd.DataFrame, seq_len: int = 128):
+    def __init__(self, df: pd.DataFrame, seq_len: int = MAX_SEQ_LEN):
         self.features = extract_features(df)
         self.seq_len = seq_len
-        self.samples = self._create_samples()
+        self.packets = self._parse_packets()
         self.cnt = 0
-        self.len = np.array(self.features["mqtt.hdrcmd"]["values"]).size
+        self.df_len = len(df)
+        self.history = list()
 
-        self._create_samples()
-
-    def _create_samples(self) -> Iterator:
+    def _parse_packets(self) -> Iterator[PacketWithContext]:
         """
-        @Description: This creates inputs for each next byte. It uses both the
-        categorical / numerical features tied to each frame along with the context
-        of the last bytes.
+        @Description: Parses the data frame into a packets with context that are suitable for
+        training and inference
 
         @Notes:
-            - This includes a sequence length which is an attention mask that will use
-            the inputs of the past to determine the next.
-            - The features are give as a dictionary where the class of values and actual list
-            of data are both given.
-            - At the momenent we only support one sequence feature
-            - Regardless of how many characters we have, we always begin predicting at the
-            first byte with a zero sequence length and then building a context up from there.
-            - We use padding and masking for short sequence lengths
+
         @Returns:
         """
+        # Divide the features into categorical, numerical, and payload
         cat_features = list()
         num_features = list()
         seq_features = list()
 
         self.cat_dims = list()
-        self.numerical_dims = 0
-        self.seq_dims = 0
+        self.num_dim = 0
+        self.seq_dim = 0
 
         for name, data in self.features.items():
             dtype = data["dtype"]
             values = data["values"]
+            if isinstance(values, np.ndarray):
+                values = values.tolist()
             if dtype == "categorical":
                 cat_features.append(values)
                 self.cat_dims.append(data["dims"])
             elif dtype == "numerical":
                 num_features.append(values)
-                self.numerical_dims += data["dims"]
+                self.num_dim += data["dims"]
             elif dtype == "sequential":
                 seq_features.append(values)
-                self.seq_dims += data["dims"]
+                self.seq_dim += data["dims"]
             else:
                 ic(
                     f"{name} has unrecognized dtype: {dtype} given for feature, ignoring ..."
@@ -96,42 +178,63 @@ class PacketDataset(Dataset):
         assert (
             len(seq_features) == 1
         ), f"Currently one and only one sequential feature is permitted, not {len(seq_features)}"
-        # Now go through all the features and add them to embedding layer
+
+        # Now run through the data
         for i, (cat_f, num_f, seq_f) in enumerate(
             zip(zip(*cat_features), zip(*num_features), zip(*seq_features))
         ):
-
+            self.cnt += 1
+            # Create a Sequence input from the parsed features
             seq = seq_f[0]
-            for i in range(len(seq) - 1):
-                # Create the window. Please not that initially we begin with no context besides
-                # The history, packet meta data, and model parameters. This is intentional.
-                input_len = min(i, self.seq_len)
-                input_bytes = list(seq[i - input_len : i]) + [0] * (
-                    self.seq_len - input_len
-                )
-                target_byte = seq[i]
-                mask = [1] * input_len + [0] * (self.seq_len - input_len)
+            seq_len = len(seq)
+            # Now pad the sequence
+            if seq_len > MAX_SEQ_LEN:
+                # We simply lose data here
+                seq = seq[:MAX_SEQ_LEN]
+                seq_len = MAX_SEQ_LEN
 
-                # The categorical and numerical features are constant throughout the packet
-                self.cnt += 1
-                yield {
-                    "input_bytes": torch.tensor(input_bytes, dtype=torch.long),
-                    "attention_mask": torch.tensor(mask, dtype=torch.bool),
-                    "seq_len": input_len,
-                    "position": torch.tensor(i, dtype=torch.long),
-                    "input_numerical": torch.tensor(num_f, dtype=torch.long),
-                    "input_categorical": torch.tensor(cat_f, dtype=torch.long),
-                    "target": torch.tensor(target_byte, dtype=torch.long),
-                }
+            elif len(seq) < MAX_SEQ_LEN:
+                seq = seq + [0] * (MAX_SEQ_LEN - seq_len)
+
+            attn_mask = torch.tensor(
+                ([1] * seq_len) + ([0] * (MAX_SEQ_LEN - seq_len)), dtype=torch.bool
+            )
+
+            assert (
+                len(seq) == MAX_SEQ_LEN
+            ), f"The sequence length {len(seq)} must equal {MAX_SEQ_LEN}"
+
+            assert (
+                len(attn_mask) == MAX_SEQ_LEN
+            ), f"The sequence length {len(attn_mask)} must equal {MAX_SEQ_LEN}"
+
+            padded_payload = SeqInput(seq, attn_mask, seq_len)
+
+            pop = ParsedPacket(
+                padded_payload,
+                torch.tensor(list(cat_f), dtype=torch.long),
+                torch.tensor(list(num_f), dtype=torch.long),
+            )
+
+            if i < CONV_CONTEXT_LEN:
+                self.history.append(pop)
+                continue
+
+            # slice for most recent history
+            ret = PacketWithContext(self.history.copy(), pop)
+            self.history.append(pop)
+            self.history = self.history[-CONV_CONTEXT_LEN:]
+
+            yield ret
 
     def __iter__(self):
         return self
 
     def __next__(self):
         try:
-            return next(self.samples)
+            return next(self.packets)
         except StopIteration:
-            ic(f"Samples end reached with total count of {self.cnt}")
+            ic(f"Batches end reached with total count of {self.cnt}")
             raise StopIteration
 
     def __len__(self):
@@ -150,9 +253,10 @@ if __name__ == "__main__":
         ds = PacketDataset(df)
 
         i = 0
-        while i < 1000:
-            sample = next(ds)
-            # print(sample)
+        while i < 100:
+            packet, cat_f, num_f = next(ds).values()
+            # print(cat_f)
+            # print(packet)
             i += 1
 
     for conv_df in conv_dfs:

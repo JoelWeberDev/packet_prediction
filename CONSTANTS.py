@@ -81,10 +81,16 @@ PACKET_COMBINER_DROPOUT = 0.2
 CONV_LSTM_DROPOUT = 0.3
 NEXT_PACKET_DROPOUT = 0.2
 
-# Traning parameters #
-NUM_EPOCHS = 10
-LEARNING_RATE = 0.001
-BATCH_SIZE = 32
-TRAIN_VAL_TEST_PERC = np.array([0.7, 0.15, 0.15])
-TRAIN_VAL_TEST_PERC /= sum(TRAIN_VAL_TEST_PERC)
-# Testing size takes up the reminader
+### Training parameters ###
+TRAIN_VAL_TEST_PERCS = np.array([0.70, 0.15, 0.15])
+TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
+
+CONV_CONTEXT_LEN = 10 # Number of packets in context
+N_EPOCHS = 10
+BATCH_SIZE = 32 
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-5
+
+DEVICE = "cpu"
+PATIENCE = 5 # minimum early stopping epochs
+CHECKPOINT_DIR = "checkpoints"

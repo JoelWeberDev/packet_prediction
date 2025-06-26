@@ -92,3 +92,5 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 
 DEVICE = "cpu"
+PATIENCE = 5 # minimum early stopping epochs
+CHECKPOINT_DIR = "checkpoints"

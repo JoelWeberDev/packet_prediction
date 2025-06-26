@@ -26,7 +26,6 @@ from icecream import ic
 # Local imports
 from CONSTANTS import *
 from preprocessing import extract_features, split_into_conversations
-from datasets import PacketDataset
 
 
 ### Byte sequence dataset ###
@@ -48,6 +47,7 @@ class PacketDataset(Dataset):
         self.seq_len = seq_len
         self.samples = self._create_samples()
         self.cnt = 0
+        self.len = np.array(self.features["mqtt.hdrcmd"]["values"]).size
 
         self._create_samples()
 
@@ -72,22 +72,22 @@ class PacketDataset(Dataset):
         num_features = list()
         seq_features = list()
 
-        self.cat_dims = 0
-        self.num_dim = 0
-        self.seq_dim = 0
+        self.cat_dims = list()
+        self.numerical_dims = 0
+        self.seq_dims = 0
 
         for name, data in self.features.items():
             dtype = data["dtype"]
             values = data["values"]
             if dtype == "categorical":
                 cat_features.append(values)
-                self.cat_dims += data["dim"]
+                self.cat_dims.append(data["dims"])
             elif dtype == "numerical":
                 num_features.append(values)
-                self.num_dim += data["dim"]
+                self.numerical_dims += data["dims"]
             elif dtype == "sequential":
                 seq_features.append(values)
-                self.seq_dim += data["dim"]
+                self.seq_dims += data["dims"]
             else:
                 ic(
                     f"{name} has unrecognized dtype: {dtype} given for feature, ignoring ..."
@@ -133,6 +133,9 @@ class PacketDataset(Dataset):
         except StopIteration:
             ic(f"Samples end reached with total count of {self.cnt}")
             raise StopIteration
+
+    def __len__(self):
+        return self.len
 
 
 if __name__ == "__main__":

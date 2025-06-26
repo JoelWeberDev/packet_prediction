@@ -12,3 +12,9 @@ l = list()
 
 l = l + [0] * 10
 print(l)
+
+TRAIN_VAL_TEST_PERC = np.array([0.70, 0.15, 0.15])
+TRAIN_VAL_TEST_PERC /= sum(TRAIN_VAL_TEST_PERC)
+
+print(TRAIN_VAL_TEST_PERC)
+print(np.sum(TRAIN_VAL_TEST_PERC))

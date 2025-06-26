@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
+from typing import List
 
 # Local imports
 from CONSTANTS import *
 from preprocessing import load_df, split_into_conversations
+from custom_datasets import PacketDataset
 
 
 class PacketEncoder(nn.Module):
@@ -314,22 +316,76 @@ class HierarchicalMQTTModel(nn.Module):
         return logits
 
 
-### Training section ###
-def model_train():
-    # Get the dataset for the conversation data
-    df = load_df()
-    conv_dfs = [  split_into_conversations(df)]
+if __name__ == "__main__":
+    ### Training section ###
+    def evaluate(
+        mqtt_model: HierarchicalMQTTModel, conv_data: List[PacketDataset]
+    ) -> float:
+        return 0.0
 
+    def train_epoch(
+        mqtt_mode: HierarchicalMQTTModel, conv_data: List[PacketDataset]
+    ) -> float:
+        return 0.0
 
+    def save_checkpoint(mqtt_model: HierarchicalMQTTModel):
+        pass
 
-    # Get the categorical and numerical dimensions
-    
-    # Define the cross entropy loss model and optimizer
-    mqtt_model = HierarchicalMQTTModel()
+    def conversation_train(
+        mqtt_model: HierarchicalMQTTModel, convs: List[PacketDataset]
+    ):
+        """
+        @Description: Splits the dataset into training testing and validation splits
+        We then train and test the model with this.
 
-    # Split the data set into conversations by conversation number
+        @Notes:
+            - We use the training / validation / testing splits defined in constants
+            for our split percentages
 
-    # Divide each conversation into testing, training, and validation splits
+        @Returns:
+        """
+        train_size = int(TRAIN_VAL_TEST_PERC[0] * len(convs))
+        val_size = int(TRAIN_VAL_TEST_PERC[1] * len(convs))
 
-    # Establish the number of epochs and create training splits for that
-    pass
+        assert val_size > 0, f"Cannot train with testing and validation sizes of 0"
+
+        train_convs = convs[:train_size]
+        val_convs = convs[train_size : train_size + val_size]
+        test_convs = convs[train_size + val_size :]
+
+        best_val_loss = 0
+
+        for epoch in range(NUM_EPOCHS):
+            train_loss = train_epoch(mqtt_model, train_convs)
+
+            val_loss = evaluate(mqtt_model, val_convs)
+
+            # Early stopping criteria
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(mqtt_model)
+
+        test_loss = evaluate(mqtt_model, test_convs)
+        print(f"Final Test Loss: {test_loss:.4f}")
+
+    def model_train():
+        # Get the dataset for the conversation data
+        df = load_df()
+
+        # Split the data set into conversations by conversation number
+        conv_dfs = [PacketDataset(conv_df) for conv_df in split_into_conversations(df)]
+
+        if len(conv_dfs) == 0:
+            return
+
+        # Get the categorical and numerical dimensions. These are all identical throughout the datasets
+        # Define the cross entropy loss model and optimizer
+        mqtt_model = HierarchicalMQTTModel(
+            categorical_dims=conv_dfs[0].cat_dims,
+            numerical_dim=conv_dfs[0].numerical_dims,
+        )
+
+        # preform the testing here
+
+        # Establish the number of epochs and create training splits for that
+        pass

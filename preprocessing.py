@@ -256,7 +256,9 @@ def extract_features(
             ind_mask = conversation_filter(df, ip1, ip2, ret_inds=True)
             if len(df.loc[ind_mask]) > 0:
                 ret_vals["conv.number"]["dims"] += 1
-                ret_vals["conv.number"]["values"][ind_mask] = ret_vals["conv.number"]["dims"]
+                ret_vals["conv.number"]["values"][ind_mask] = ret_vals["conv.number"][
+                    "dims"
+                ]
 
     # Add the directionality conversation flag to each conversation where
     # client -> client = 0 broker -> client = 1, client -> broker = 2

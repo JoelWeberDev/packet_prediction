@@ -158,7 +158,7 @@ def get_column_types() -> Dict[str, type]:
 
 
 def extract_features(
-    df: pd.DataFrame, inplace: bool = True
+    df: pd.DataFrame, n_convs: int, inplace: bool = True
 ) -> Dict[str, Dict[str, Union[np.ndarray, List, str, int]]]:
     """
     @Description:
@@ -185,6 +185,7 @@ def extract_features(
         "tcp.payload",
         "frame.number",
         "frame.time_delta",
+        "conv.number",
     ]
 
     for colname in req_features:
@@ -228,8 +229,8 @@ def extract_features(
         },  # flow direction classification based ips
         "conv.number": {
             "dtype": "categorical",
-            "values": np.zeros(n_rows, dtype=np.uint8),  # categorical
-            "dims": 0,  # gets incremented as we add conversations
+            "values": np.array(df["conv.number"], dtype=np.uint16),  # categorical
+            "dims": max(2, n_convs),  # gets incremented as we add conversations
         },  # unique number assiged to each conversation
         "mqtt.msg": {
             "dtype": "sequential",
@@ -237,21 +238,6 @@ def extract_features(
             "dims": 256,  # volcab size of 256 byte options
         },  # Actual data within the mqtt message. Our whole objective
     }
-
-    # Now convert add a row of conversation number where we assign each conversation between 2
-    # communicating devices a specific number. There are choose(n_ips, 2) possible converation numbers
-    ips = list(col_values_set(df, "ip.src").keys())
-
-    while len(ips) > 0:
-        ip1 = ips.pop()
-        for ip2 in ips:
-            # Get an index map of all the rows includeing the 2 ips
-            ind_mask = conversation_filter(df, ip1, ip2, ret_inds=True)
-            if len(df.loc[ind_mask]) > 0:
-                ret_vals["conv.number"]["dims"] += 1
-                ret_vals["conv.number"]["values"][ind_mask] = ret_vals["conv.number"][
-                    "dims"
-                ]
 
     # Add the directionality conversation flag to each conversation where
     # client -> client = 0 broker -> client = 1, client -> broker = 2
@@ -338,7 +324,9 @@ def load_df(print_info: bool = False) -> pd.DataFrame:
     return df
 
 
-def split_into_conversations(df: pd.DataFrame) -> List[pd.DataFrame]:
+def split_into_conversations(
+    df: pd.DataFrame, add_conv_num: bool = True
+) -> List[pd.DataFrame]:
     ips = list(col_values_set(df, SRC_IP_TAG).keys())
 
     convs = list()
@@ -347,8 +335,10 @@ def split_into_conversations(df: pd.DataFrame) -> List[pd.DataFrame]:
         ip1 = ips.pop()
 
         for ip2 in ips:
-            conv_df = conversation_filter(df, ip1, ip2)
+            conv_df = conversation_filter(df, ip1, ip2).copy()
             if len(conv_df) > 0:
+                if add_conv_num:
+                    conv_df["conv.number"] = [len(convs) + 1] * len(conv_df)
                 convs.append(conv_df)
 
     return convs

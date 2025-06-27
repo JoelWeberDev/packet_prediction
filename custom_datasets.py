@@ -41,12 +41,25 @@ class SeqInput:
     attention_mask: torch.Tensor
     input_len: int
 
+    def __str__(self):
+        return f"padded_len: {self.attention_mask.size()} \nactual len: {self.input_len} \ninput bytes: {self.input_bytes[self.attention_mask].tolist()}"
+
 
 @dataclass
 class ParsedPacket:
     padded_payload: SeqInput
+    cat_names: list
     cat_features: torch.Tensor
+    numerical_names: list
     numerical_features: torch.Tensor
+
+    def __str__(self):
+
+        ret = f"cat_features: {[f'{name}: {value}' for name, value in zip(self.cat_names, self.cat_features.tolist())]}\n"
+        ret += f"numerical_features: {[f'{name}: {value}' for name, value in zip(self.numerical_names, self.numerical_features.tolist())]}\n"
+        ret += f"{self.padded_payload}\n"
+
+        return ret
 
 
 @dataclass
@@ -130,16 +143,14 @@ class PacketDataset(Dataset):
             [frame.number, frame.time_delta, mqtt.len]
     """
 
-    def __init__(self, df: pd.DataFrame, seq_len: int = MAX_SEQ_LEN):
-        self.features = extract_features(df)
+    def __init__(self, df: pd.DataFrame, n_convs: int, seq_len: int = MAX_SEQ_LEN):
+        self.features = extract_features(df, n_convs=n_convs)
         self.seq_len = seq_len
         self.cnt = 0
         self.df_len = len(df)
         self.history = list()
 
         self._process_packets()
-
-        # Call
 
     def _process_packets(self):
         """
@@ -150,9 +161,9 @@ class PacketDataset(Dataset):
         @Returns:
         """
         # Divide the features into categorical, numerical, and payload
-        self.cat_features = list()
-        self.num_features = list()
-        self.seq_features = list()
+        self.cat_features = dict()
+        self.num_features = dict()
+        self.seq_features = dict()
 
         self.cat_dims = list()
         self.num_dim = 0
@@ -164,13 +175,13 @@ class PacketDataset(Dataset):
             if isinstance(values, np.ndarray):
                 values = values.tolist()
             if dtype == "categorical":
-                self.cat_features.append(values)
+                self.cat_features[name] = values
                 self.cat_dims.append(data["dims"])
             elif dtype == "numerical":
-                self.num_features.append(values)
+                self.num_features[name] = values
                 self.num_dim += data["dims"]
             elif dtype == "sequential":
-                self.seq_features.append(values)
+                self.seq_features[name] = values
                 self.seq_dim += data["dims"]
             else:
                 ic(
@@ -199,9 +210,9 @@ class PacketDataset(Dataset):
         # Now run through the data
         for i, (cat_f, num_f, seq_f) in enumerate(
             zip(
-                zip(*self.cat_features),
-                zip(*self.num_features),
-                zip(*self.seq_features),
+                zip(*self.cat_features.values()),
+                zip(*self.num_features.values()),
+                zip(*self.seq_features.values()),
             )
         ):
             self.cnt += 1
@@ -235,7 +246,9 @@ class PacketDataset(Dataset):
 
             pop = ParsedPacket(
                 padded_payload,
+                list(self.cat_features.keys()),
                 torch.tensor(list(cat_f), dtype=torch.long),
+                list(self.num_features.keys()),
                 torch.tensor(list(num_f), dtype=torch.long),
             )
 
@@ -273,14 +286,11 @@ if __name__ == "__main__":
     conv_dfs = split_into_conversations(df)
 
     def test_packet_dataset(df: pd.DataFrame):
-        ds = PacketDataset(df)
+        ds = PacketDataset(df, 1)
 
-        i = 0
-        while i < 100:
-            packet, cat_f, num_f = next(ds).values()
-            # print(cat_f)
-            # print(packet)
-            i += 1
+        pkg = next(ds)
+
+        print(pkg.target)
 
     for conv_df in conv_dfs:
         print(len(conv_df))

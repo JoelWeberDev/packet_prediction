@@ -12,6 +12,8 @@ adjustment.
 
 # Python imports
 import numpy as np
+import torch
+from icecream import ic
 
 # Local imports
 
@@ -82,15 +84,17 @@ CONV_LSTM_DROPOUT = 0.3
 NEXT_PACKET_DROPOUT = 0.2
 
 ### Training parameters ###
-TRAIN_VAL_TEST_PERCS = np.array([0.70, 0.15, 0.15])
+TRAIN_VAL_TEST_PERCS = np.array([0.10, 0.15, 0.15])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
-CONV_CONTEXT_LEN = 10 # Number of packets in context
+CONV_CONTEXT_LEN = 10  # Number of packets in context
 N_EPOCHS = 10
-BATCH_SIZE = 32 
+BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 
-DEVICE = "cpu"
-PATIENCE = 5 # minimum early stopping epochs
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ic(f"Using device type: {DEVICE}")
+PATIENCE = 5  # minimum early stopping epochs
 CHECKPOINT_DIR = "checkpoints"
+DEBUG_MODE = False

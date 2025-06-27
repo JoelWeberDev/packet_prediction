@@ -133,24 +133,26 @@ class PacketDataset(Dataset):
     def __init__(self, df: pd.DataFrame, seq_len: int = MAX_SEQ_LEN):
         self.features = extract_features(df)
         self.seq_len = seq_len
-        self.packets = self._parse_packets()
         self.cnt = 0
         self.df_len = len(df)
         self.history = list()
 
-    def _parse_packets(self) -> Iterator[PacketWithContext]:
+        self._process_packets()
+
+        # Call
+
+    def _process_packets(self):
         """
-        @Description: Parses the data frame into a packets with context that are suitable for
-        training and inference
+        @Description: Prepares the dimensionality of the dataset
 
         @Notes:
 
         @Returns:
         """
         # Divide the features into categorical, numerical, and payload
-        cat_features = list()
-        num_features = list()
-        seq_features = list()
+        self.cat_features = list()
+        self.num_features = list()
+        self.seq_features = list()
 
         self.cat_dims = list()
         self.num_dim = 0
@@ -162,26 +164,45 @@ class PacketDataset(Dataset):
             if isinstance(values, np.ndarray):
                 values = values.tolist()
             if dtype == "categorical":
-                cat_features.append(values)
+                self.cat_features.append(values)
                 self.cat_dims.append(data["dims"])
             elif dtype == "numerical":
-                num_features.append(values)
+                self.num_features.append(values)
                 self.num_dim += data["dims"]
             elif dtype == "sequential":
-                seq_features.append(values)
+                self.seq_features.append(values)
                 self.seq_dim += data["dims"]
             else:
                 ic(
                     f"{name} has unrecognized dtype: {dtype} given for feature, ignoring ..."
                 )
 
-        assert (
-            len(seq_features) == 1
-        ), f"Currently one and only one sequential feature is permitted, not {len(seq_features)}"
+        print(
+            f"cat_dims: {self.cat_dims}, num_dims: {self.num_dim}, seq_dims: {self.seq_dim}"
+        )
 
+        assert (
+            len(self.seq_features) == 1
+        ), f"Currently one and only one sequential feature is permitted, not {len(self.seq_features)}"
+
+        self.packets = self._parse_packets()
+
+    def _parse_packets(self) -> Iterator[PacketWithContext]:
+        """
+        @Description: Parses the data frame into a packets with context that are suitable for
+        training and inference
+
+        @Notes:
+
+        @Returns:
+        """
         # Now run through the data
         for i, (cat_f, num_f, seq_f) in enumerate(
-            zip(zip(*cat_features), zip(*num_features), zip(*seq_features))
+            zip(
+                zip(*self.cat_features),
+                zip(*self.num_features),
+                zip(*self.seq_features),
+            )
         ):
             self.cnt += 1
             # Create a Sequence input from the parsed features
@@ -194,7 +215,9 @@ class PacketDataset(Dataset):
                 seq_len = MAX_SEQ_LEN
 
             elif len(seq) < MAX_SEQ_LEN:
-                seq = seq + [0] * (MAX_SEQ_LEN - seq_len)
+                seq = torch.tensor(
+                    seq.tolist() + [0] * (MAX_SEQ_LEN - seq_len), dtype=torch.long
+                )
 
             attn_mask = torch.tensor(
                 ([1] * seq_len) + ([0] * (MAX_SEQ_LEN - seq_len)), dtype=torch.bool

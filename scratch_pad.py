@@ -6,12 +6,6 @@ import torch
 from typing import Iterable
 
 
-t1 = torch.tensor(list(range(10)))
-t2 = torch.tensor(list(range(10, 20)))
+t = torch.stack([torch.tensor(list(range(i, i + 10))) for i in range(10)])
 
-# for a, b in zip(t1, t2):
-#     print(a, b)
-
-t = torch.tensor([[0] * 10 for i in range(10)])
-
-print(t)
+print(t.shape)

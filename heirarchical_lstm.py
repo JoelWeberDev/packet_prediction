@@ -31,6 +31,7 @@
 
 """
 
+import sys, os
 import torch
 import torch.nn as nn
 from typing import List, Dict
@@ -39,7 +40,7 @@ from dataclasses import dataclass
 # Local imports
 from CONSTANTS import *
 from preprocessing import load_df, split_into_conversations
-from datasets import PacketDataset, SeqInput, ParsedPacket, PacketWithContext
+from custom_datasets import PacketDataset, SeqInput, ParsedPacket, PacketWithContext
 
 
 class PacketEncoder(nn.Module):
@@ -406,11 +407,12 @@ class HierarchicalMQTTModel(nn.Module):
             categorical_dims=categorical_dims, numerical_dim=numerical_dim
         )
 
+        self.device = device
         self.to(device)
 
     def forward(
         self,
-        conversation_packets: torch.Tensor,
+        conversation_packets: List[List[ParsedPacket]],
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
         target_payload: torch.Tensor | None = None,
@@ -431,20 +433,33 @@ class HierarchicalMQTTModel(nn.Module):
 
         @Returns: logits distribution of next packet prediction.
         """
-        batch_size, context_length = conversation_packets.shape
+        batch_size = len(conversation_packets)
+        context_length = len(conversation_packets[0])
+
+        for ctx in conversation_packets:
+            assert (
+                len(ctx) == context_length
+            ), f"All the packets must have the same context length of {context_length}"
 
         # Embedded packet shape: [byte_embeddings + cat_embed_dim + num_embed_dim]
         # individual embedding shape: [context_length, embedded_packet_length]
         packet_representations = list()
         for i in range(context_length):
             # get the context packets
-            packet = conversation_packets[:, i]  # [batch_size, 1]
+            # packet = conversation_packets[:, i]  # [batch_size, 1]
+            packets = [ctx[i] for ctx in conversation_packets]
 
             # extract the individual elements from each packets
-            payload = torch.stack([p.padded_payload.input_bytes for p in packet])
-            attn_mask = torch.stack([p.padded_payload.attention_mask for p in packet])
-            cat_feats = torch.stack([p.cat_features for p in packet])
-            numerical_feats = torch.stack([p.numerical_features for p in packet])
+            payload = torch.stack([p.padded_payload.input_bytes for p in packets]).to(
+                DEVICE
+            )
+            attn_mask = torch.stack(
+                [p.padded_payload.attention_mask for p in packets]
+            ).to(DEVICE)
+            cat_feats = torch.stack([p.cat_features for p in packets]).to(DEVICE)
+            numerical_feats = torch.stack([p.numerical_features for p in packets]).to(
+                DEVICE
+            )
 
             # TODO: Test how this is encoded
             packet_repr = self.packet_encoder(
@@ -452,7 +467,7 @@ class HierarchicalMQTTModel(nn.Module):
             )
             packet_representations.append(packet_repr)
 
-        packet_representations = torch.stack(packet_representations, dim=1)
+        packet_representations = torch.stack(packet_representations, dim=1).to(DEVICE)
 
         # Process through conversation LSTM
         conversation_outputs, _ = self.conversation_lstm(packet_representations)
@@ -511,13 +526,11 @@ def training_step(model, batch: List[PacketWithContext], optimizer, criterion) -
     @Returns:
     """
     # Parse the data into the proper format
-    conversation_packets = torch.stack([torch.stack(pc.context) for pc in batch]).to(
-        model.device
-    )  # [batch_size, context_len]
-    next_cat = torch.tensor([pd.target.cat_features for pd in batch]).to(
+    conversation_packets = [pc.context for pc in batch]
+    next_cat = torch.stack([pd.target.cat_features for pd in batch]).to(
         model.device
     )  # [batch_size, cat_len]
-    next_numerical = torch.tensor([pd.target.numerical_features for pd in batch]).to(
+    next_numerical = torch.stack([pd.target.numerical_features for pd in batch]).to(
         model.device
     )  # [batch_size, num_len]
     # Now use the attention masks to ignore any predictions out of range
@@ -537,11 +550,14 @@ def training_step(model, batch: List[PacketWithContext], optimizer, criterion) -
     logits = model(
         conversation_packets, next_cat, next_numerical, target_payload, attn_mask
     )
-    batch_size, seq_len, vocab_size = logits.shape()
+    # Since we are packing the sequences this reduces the sequence length
+    # to the largest attention mask length
+    batch_size, max_seq_len, vocab_size = logits.shape
     logits = logits.view(-1, vocab_size)
 
-    targets = target_payload.view(-1)
-    valid_inds = attn_mask.view(-1).bool()
+    targets = target_payload[:, :max_seq_len].reshape(-1)
+    valid_inds = attn_mask[:, :max_seq_len].reshape(-1).bool()
+
     valid_logits = logits[valid_inds]
     valid_targets = targets[valid_inds]
 
@@ -598,10 +614,12 @@ def model_train():
 
     if len(conv_dfs) == 0:
         print(f"Number of conversations must not be zero")
-        return
+        return None, [], []
 
     # Get the categorical and numerical dimensions they will all be the same throughout the conversations
     cat_dims = conv_dfs[0].cat_dims
+    # Adjust the cat dims conversation number to match the total number of conversations
+    cat_dims[3] = len(conv_dfs)
     numerical_dim = conv_dfs[0].num_dim
 
     # Define the cross entropy loss model and optimizer
@@ -673,5 +691,5 @@ def model_train():
 
 
 if __name__ == "__main__":
-    #
-    pass
+    # The only thing to do is call the model_train function
+    mqtt_model, train_losses, validation_losses = model_train()

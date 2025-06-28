@@ -16,34 +16,30 @@
             - Creates a logits byte prediciton for each of the unmasked bytes in the sequence.
 
 @Questions:
-    - Is the next byte predictor going to work in the training phase
-    - How can we test where the pipeline is failing?
-    - How are batch sizes going to be done?
+    - What does the packing actually do?
+    - Are hidden states persisent throughout calls? Do I need to store that hidden state and
+    pass it in each time I use the LSTM?
+    - How much should I rely on memory of internal states and how much on the context?
+    - How to create an enum in python
+    - If I am running the model on an embedded system, what is a reasonable parameter count?
+    - Is it worth zeroing out the embeddings for null characters?
 
 
 @TODO:
-    - Implement autoregresive next packet prediction
-    - Pad all the target sequences to length and construct an attention mask for them
-    - Training
-        - Data preprocessing
-        - Define the optimizer
-        - Create a cross entropy loss function for the optimization
+    - Refactor the very broken next packet predicter
+    - Fix the byte sequence encoding in the packet encoder
 
 """
 
-import sys, os
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from dataclasses import dataclass
-from icecream import ic
 
 # Local imports
 from CONSTANTS import *
 from preprocessing import load_df, split_into_conversations
-from custom_datasets import PacketDataset, SeqInput, ParsedPacket, PacketWithContext
+from custom_datasets import PacketDataset, ParsedPacket, PacketWithContext
 
 
 class PacketEncoder(nn.Module):
@@ -70,6 +66,7 @@ class PacketEncoder(nn.Module):
         # Calculate input dimension for packet LSTM
         cat_embed_dim = sum(max(50, cat_size // 2) for cat_size in categorical_dims)
         # packet_lstm_input_dim = byte_embed_dim + cat_embed_dim + numerical_dim
+        # TODO: this may need to be changed. We are only embedding 1 byte not the entire sequence
         packet_lstm_input_dim = BYTE_EMBED_DIM
 
         # Packet-level LSTM (processes bytes within packet)
@@ -195,7 +192,29 @@ class ConversationLSTM(nn.Module):
 
 
 class NextPacketPredictor(nn.Module):
-    """Predicts next packet payload given conversation context"""
+    """
+    @Description: We take a context history of past packets, the target packet's meta data
+    and the past bytes if there are any to autoregressively predict the next byte in the
+    sequence.
+        Input for next byte: CAT_EMBED_DIMS + NUM_EMBED_DIMS + CONVERSATION_CONTEXT_DIMS + (SEQ_LEN * BYTE_EMBED_DIMS)
+
+    Since the byte context size is fixed, but we are allowing for variable length input
+    sequences we need to use the NULL token for padding to the FRONT!!. In the sequence the
+    byte at the very end is considered the most recent one.
+
+    @Notes:
+        - All the input except for the sequence embeddings remains the same.
+        - We will not enforce a fixed sequence length, but rather pack padded sequences
+        - In addition to the 256 byte vocabulary we also enlist a number of special tokens
+        each defined in the CONSTANTS.py file.
+        - The SOS characeter at the start of each packet counts in the sequence length count
+        - Target payloads do not need to be passed with lenths of MAX_SEQ_LEN, rather just
+        padded with null character to meet the length of the longest payload
+        - When processing the the predictions we project down to 256 for the bytes only and not
+        the special tokens. ***
+
+    @Returns:
+    """
 
     def __init__(self, categorical_dims=list(), numerical_dim=0):
         super().__init__()
@@ -210,20 +229,26 @@ class NextPacketPredictor(nn.Module):
         )
 
         # Combine conversation context with next packet metadata
-        context_dim = CONVERSATIONAL_HIDDEN_DIM + cat_embed_dim + numerical_dim
+        self.input_size = (
+            CONVERSATIONAL_HIDDEN_DIM
+            + cat_embed_dim
+            + numerical_dim
+            + (BYTE_CONTEXT_LEN * BYTE_EMBED_DIM)
+        )
 
         # Decoder LSTM for payload generation
         self.decoder_lstm = nn.LSTM(
-            input_size=context_dim
-            + BYTE_EMBED_DIM,  # context + previous byte embedding
+            input_size=self.input_size,
             hidden_size=CONVERSATIONAL_HIDDEN_DIM,
             num_layers=NEXT_PACKET_LAYERS,
             batch_first=True,
             dropout=NEXT_PACKET_DROPOUT,
         )
 
-        # Output projection
-        self.output_projection = nn.Linear(CONVERSATIONAL_HIDDEN_DIM, BYTE_VOCAB_DIM)
+        # Output projection on just the 256 bytes excluding the special tokens
+        self.output_projection = nn.Linear(
+            CONVERSATIONAL_HIDDEN_DIM, BYTE_VOCAB_DIM - N_SPECIAL_TOKNES
+        )
 
         # Byte embedding for decoder
         self.byte_embedding = nn.Embedding(BYTE_VOCAB_DIM, BYTE_EMBED_DIM)
@@ -234,7 +259,6 @@ class NextPacketPredictor(nn.Module):
         next_packet_categorical: torch.Tensor,
         next_packet_numerical: torch.Tensor,
         target_payload: None | torch.Tensor = None,
-        attn_mask: None | torch.Tensor = None,
     ):
         """
         @Args:
@@ -267,20 +291,10 @@ class NextPacketPredictor(nn.Module):
             # Inference mode - autoregressive generation
             return self._generate_payload(context, lengths)
         else:
-            assert not isinstance(
-                attn_mask, type(None)
-            ), f"An attention mask corresponding to the target payload must be provided"
-
-            assert (
-                target_payload.shape == attn_mask.shape
-            ), f"Target payload shape: {target_payload.shape} != attention mask shape: {attn_mask.shape}"
-
             # Training mode - teacher forcing
-            return self._train_forward(context, target_payload, attn_mask)
+            return self._train_forward(context, target_payload)
 
-    def _train_forward(
-        self, context, target_payload: torch.Tensor, attn_mask: torch.Tensor
-    ):
+    def _train_forward(self, context, target_payload: torch.Tensor):
         """
         @Description: Uses the batch contexts along the prior embedded next packet features
         to predict the entire sequence of next bytes for the target packet.
@@ -297,25 +311,42 @@ class NextPacketPredictor(nn.Module):
             logits: torch.tensor([]) -> [batch_size, payload_length, BYTE_VOCAB_DIMS]
         """
         batch_size, max_len = target_payload.shape  # [batch_size, payload_length]
+        ctx_batch_size, ctx_embedded_len = (
+            context.shape
+        )  # [batch_size, packet_ctx_len + meta_data_embed_len]
 
         # Since we are dealing with variable payload lengths we will need to pack the payloads
         # This operates on the assumption that
-        payload_lens = attn_mask.sum(dim=1)
-
-        # Embed decoder input
-        decoder_embeds = self.byte_embedding(
-            target_payload
-        )  # [batch_size, max_len, BYTE_EMBED_DIMS]
-
-        # ensure that the attention mask is applied to the embeddings
-        mask = attn_mask.unsqueeze(-1)
-        mask_embeds = decoder_embeds * mask
+        mask = target_payload != NULL
+        payload_lens = mask.sum(1)
 
         # Repeat context for each timestep in the payload so that we predict byte by byte
-        context_repeated = context.unsqueeze(1).repeat(1, max_len, 1)
+        # context_repeated = context.unsqueeze(1).repeat(1, max_len, 1) # [batch_size, max_length, ctx_len]
+        lstm_input = torch.zeros(
+            (batch_size, max_len, self.input_size), dtype=torch.long
+        )
+
+        # initialize the empty lstm input
+        for i, payload in enumerate(target_payload):
+            padded_payload_emb = self.byte_embedding(
+                torch.cat(
+                    [
+                        torch.ones(BYTE_CONTEXT_LEN - 1, dtype=torch.long) * NULL,
+                        torch.tensor(SOS),
+                        payload,
+                    ],
+                    dim=-1,
+                )
+            )
+            for j in range(0, max_len):
+                # Create the embeddings for the context
+                lstm_input[i, j] = torch.cat(
+                    [context, padded_payload_emb[j : j + BYTE_CONTEXT_LEN].reshape(-1)],
+                    dim=-1,
+                )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
 
         # Combine context with decoder embeddings
-        lstm_input = torch.cat([context_repeated, mask_embeds], dim=-1)
+        # lstm_input = torch.cat([context_repeated, mask_embeds], dim=-1)
         packed_input = nn.utils.rnn.pack_padded_sequence(
             lstm_input, payload_lens.cpu(), batch_first=True, enforce_sorted=False
         )
@@ -329,11 +360,11 @@ class NextPacketPredictor(nn.Module):
         # Project to vocabulary
         logits = self.output_projection(decoder_output)
 
-        return logits  # [batch_size, payload_size, BYTE_EMBED_DIMS]
+        return logits  # [batch_size, payload_size, BYTE_VOCAB_SIZE - N_SPECIAL_TOKNES]
 
     def _generate_payload(
         self, context: torch.Tensor, msg_lens: torch.Tensor
-    ) -> List[SeqInput]:
+    ) -> List[torch.Tensor]:
         """
         @Description: Goes through autoregressively predicting the packet payload byte by byte
 
@@ -344,7 +375,7 @@ class NextPacketPredictor(nn.Module):
         @TEST:
             - Does this padded sequnce only predict for a single byte? What is the output shape?
 
-        @Returns: List[SeqInput]
+        @Returns: List[torch.Tensor]
         """
         # Autoregressively predict the next byte in the packet, adding it to the context each time
         ctx_batch_size, context_len = context.shape
@@ -354,28 +385,35 @@ class NextPacketPredictor(nn.Module):
         ), f"_generate_payload failed with batch size mismatch {batch_size} != {ctx_batch_size}"
 
         max_len = int(msg_lens.max())
-        pred_payloads = torch.zeros(
-            (batch_size, max_len), dtype=torch.long, device=DEVICE
-        )
+        pred_payloads = torch.ones((batch_size, max_len), dtype=torch.long) * NULL
 
-        hidden = None
+        padded_pred_payload = torch.cat(
+            [
+                torch.ones((batch_size, BYTE_CONTEXT_LEN - 1), dtype=torch.long)
+                * NULL,  # Prior null padding for index convienience
+                torch.ones((batch_size, 1), dtype=torch.long)
+                * SOS,  # Add the start of sentence to align at index [0:BYTE_CONTEXT_LEN]
+                torch.ones((batch_size, max_len), dtype=torch.long)
+                * NULL,  # Allocation for the byte predictions
+            ],
+            dim=-1,
+        )
 
         for i in range(max_len):
             # Encode only the prior bytes
-            byte_embeds = self.byte_embedding(pred_payloads[:, :i])
+            byte_embeds = self.byte_embedding(
+                padded_pred_payload[:, i : i + BYTE_CONTEXT_LEN]
+            ).reshape(batch_size, -1)
 
             # make a copy of the context for the current timestamp
-            context_step = context.unsqueeze(1)
+            context_step = context.unsqueeze(1)  # add another dimension to the tensor
 
-            if i > 1:
-                lstm_input = torch.cat([context_step, byte_embeds], dim=-1)
-            else:
-                lstm_input = context_step
-
-            # Pack the padded input sequences
+            lstm_input = torch.cat(
+                [context_step, byte_embeds], dim=1
+            )  # [batch_size, full_context_size]
 
             # Get the LSTM output for the given input
-            output, hidden = self.decoder_lstm(lstm_input, hidden)
+            output, _ = self.decoder_lstm(lstm_input)
 
             logits = self.output_projection(
                 output[:, -1, :]
@@ -383,7 +421,7 @@ class NextPacketPredictor(nn.Module):
             # Select the most likely byte for each
             pred_byte = logits.argmax(dim=-1)
 
-            pred_payloads[:, i] = pred_byte
+            pred_payloads[:, i + BYTE_CONTEXT_LEN] = pred_byte
 
         # Now create attention mask for each msg length
         attn_masks = torch.tensor(
@@ -391,10 +429,12 @@ class NextPacketPredictor(nn.Module):
             dtype=torch.bool,
         )
 
-        # Now construct the sequence of SeqInputs
+        # Now construct the sequence of output payload predictions
         return [
-            SeqInput(payload, attn_mask, int(attn_mask.sum(dim=1)))
-            for payload, attn_mask in zip(pred_payloads, attn_masks)
+            payload[attn_mask]
+            for payload, attn_mask in zip(
+                pred_payloads[:, BYTE_CONTEXT_LEN:], attn_masks
+            )
         ]
 
 
@@ -416,13 +456,11 @@ class HierarchicalMQTTModel(nn.Module):
             categorical_dims=categorical_dims, numerical_dim=numerical_dim
         )
 
-        self.device = device
-        # This recursively moves all the parameters and submodules to the device
         self.to(device)
 
     def forward(
         self,
-        conversation_packets: List[List[ParsedPacket]],
+        conversation_packets: torch.Tensor,
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
         target_payload: torch.Tensor | None = None,
@@ -443,43 +481,20 @@ class HierarchicalMQTTModel(nn.Module):
 
         @Returns: logits distribution of next packet prediction.
         """
-        batch_size = len(conversation_packets)
-        context_length = len(conversation_packets[0])
-
-        for ctx in conversation_packets:
-            assert (
-                len(ctx) == context_length
-            ), f"All the packets must have the same context length of {context_length}"
-
-        # Send the input parameters to the device
-        next_cat.to(self.device)
-        next_numerical.to(self.device)
-
-        if isinstance(target_payload, torch.Tensor):
-            target_payload.to(self.device)
-
-        if isinstance(attn_mask, torch.Tensor):
-            attn_mask.to(self.device)
+        batch_size, context_length = conversation_packets.shape
 
         # Embedded packet shape: [byte_embeddings + cat_embed_dim + num_embed_dim]
         # individual embedding shape: [context_length, embedded_packet_length]
         packet_representations = list()
         for i in range(context_length):
             # get the context packets
-            # packet = conversation_packets[:, i]  # [batch_size, 1]
-            packets = [ctx[i] for ctx in conversation_packets]
+            packet = conversation_packets[:, i]  # [batch_size, 1]
 
             # extract the individual elements from each packets
-            payload = torch.stack([p.padded_payload.input_bytes for p in packets]).to(
-                self.device
-            )
-            attn_mask = torch.stack(
-                [p.padded_payload.attention_mask for p in packets]
-            ).to(self.device)
-            cat_feats = torch.stack([p.cat_features for p in packets]).to(self.device)
-            numerical_feats = torch.stack([p.numerical_features for p in packets]).to(
-                self.device
-            )
+            payload = torch.stack([p.padded_payload.input_bytes for p in packet])
+            attn_mask = torch.stack([p.padded_payload.attention_mask for p in packet])
+            cat_feats = torch.stack([p.cat_features for p in packet])
+            numerical_feats = torch.stack([p.numerical_features for p in packet])
 
             # TODO: Test how this is encoded
             packet_repr = self.packet_encoder(
@@ -487,9 +502,7 @@ class HierarchicalMQTTModel(nn.Module):
             )
             packet_representations.append(packet_repr)
 
-        packet_representations = torch.stack(packet_representations, dim=1).to(
-            self.device
-        )
+        packet_representations = torch.stack(packet_representations, dim=1)
 
         # Process through conversation LSTM
         conversation_outputs, _ = self.conversation_lstm(packet_representations)
@@ -504,12 +517,12 @@ class HierarchicalMQTTModel(nn.Module):
             next_numerical,
             target_payload,
             attn_mask,
-        )  # [batch_size, payload_len, bytes_dim]
+        )
 
         return logits
 
 
-### Training / Validation section ###
+### Training section ###
 def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
     train_idx = int(TRAIN_VAL_TEST_PERCS[0] * len(conv_dfs))
     val_idx = int(TRAIN_VAL_TEST_PERCS[1] * len(conv_dfs))
@@ -528,9 +541,7 @@ def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]
     }
 
 
-def forward_step(
-    model, batch: List[PacketWithContext], optimizer, criterion, train: bool = True
-) -> Tuple[float, float]:
+def training_step(model, batch: List[PacketWithContext], optimizer, criterion) -> float:
     """
     @Description: Each training step works to predict the next packet in the conversation.
     To do this it requires a context of length CONV_CONTEXT_LEN and a target packet; the
@@ -550,15 +561,18 @@ def forward_step(
     @Returns:
     """
     # Parse the data into the proper format
-    conversation_packets = [pc.context for pc in batch]
-    next_cat = torch.stack([pd.target.cat_features for pd in batch]).to(
+    conversation_packets = torch.stack([torch.stack(pc.context) for pc in batch]).to(
+        model.device
+    )  # [batch_size, context_len]
+    next_cat = torch.tensor([pd.target.cat_features for pd in batch]).to(
         model.device
     )  # [batch_size, cat_len]
-    next_numerical = torch.stack([pd.target.numerical_features for pd in batch]).to(
+    next_numerical = torch.tensor([pd.target.numerical_features for pd in batch]).to(
         model.device
     )  # [batch_size, num_len]
-
     # Now use the attention masks to ignore any predictions out of range
+    # Get max payload length in the batch
+    max_len = np.max([len(pd.target.padded_payload.input_bytes) for pd in batch])
     target_payload = torch.stack(
         [pd.target.padded_payload.input_bytes for pd in batch]
     ).to(model.device)
@@ -571,49 +585,29 @@ def forward_step(
 
     optimizer.zero_grad()
 
-    if train:
-        # Reshape the logits to line up all the predictions across the batches
-        logits = model(
-            conversation_packets, next_cat, next_numerical, target_payload, attn_mask
-        )
-    else:
-        logits = model(conversation_packets, next_cat, next_numerical)
-
-    # Since we are packing the sequences this reduces the sequence length
-    # to the largest attention mask length
-    batch_size, max_seq_len, vocab_size = logits.shape
+    # Reshape the logits to line up all the predictions across the batches
+    logits = model(
+        conversation_packets, next_cat, next_numerical, target_payload, attn_mask
+    )
+    batch_size, seq_len, vocab_size = logits.shape()
     logits = logits.view(-1, vocab_size)
 
-    targets = target_payload[:, :max_seq_len].reshape(-1)
-    valid_inds = attn_mask[:, :max_seq_len].reshape(-1).bool()
-
-    valid_logits = logits[valid_inds]  # [total_valid_bytes, bytes_dim]
-    valid_targets = targets[valid_inds]  # [total_valid_bytes]
+    targets = target_payload.view(-1)
+    valid_inds = attn_mask.view(-1).bool()
+    valid_logits = logits[valid_inds]
+    valid_targets = targets[valid_inds]
 
     # Pass into the criterion
     loss = criterion(valid_logits, valid_targets)
 
-    if train:
-        # Back prop
-        loss.backward()
-        optimizer.step()
+    # Back prop
+    loss.backward()
+    optimizer.step()
 
-    acc = compute_accuracy(valid_logits, valid_targets)
-
-    return loss.item(), acc
+    return loss.item()
 
 
-@dataclass
-class ConvResults:
-    avg_loss: float
-    avg_acc: float
-    conv_loss: List[float]
-    conv_acc: List[float]
-
-
-def run_conv(
-    model, conv_df: PacketDataset, optimizer, criterion, train: bool = True
-) -> ConvResults:
+def train_conv(model, conv_df: PacketDataset, optimizer, criterion):
     """
     @Description: This does the batching and training for a given conversation
 
@@ -622,9 +616,8 @@ def run_conv(
     @Returns:
     """
     model.train()  # switches to training mode
-    batch_num = 0
-    conv_loss = list()
-    conv_acc = list()
+    total_loss = 0
+    batch_count = 0
 
     # Go through the packets by batch size and perform the training step for each batch
     while True:
@@ -639,40 +632,11 @@ def run_conv(
             break
 
         # Process batch
-        loss, acc = forward_step(model, batch, optimizer, criterion, train=train)
-        batch_num += 1
+        loss = training_step(model, batch, optimizer, criterion)
+        total_loss += loss
+        batch_count += 1
 
-        if DEBUG_MODE:
-            conv_loss.append(loss)
-            conv_acc.append(acc)
-
-            # Print some helpful info about the training step
-            print_update(
-                batch_num=batch_num,
-                batch_size=len(batch),
-                loss=loss,
-                acc=acc,
-                avg_loss=np.mean(conv_loss),
-                avg_acc=np.mean(conv_acc),
-            )
-
-    if DEBUG_MODE:
-        plot_metrics(
-            conv_loss, f"Conversation loss", x_label="Batches", y_label="Batch Loss"
-        )
-        plot_metrics(
-            conv_acc,
-            f"Conversation accuracy",
-            x_label="Batches",
-            y_label="Batch accuracy",
-        )
-
-    return ConvResults(
-        np.mean(conv_loss) if len(conv_loss) > 0 else float("inf"),
-        np.mean(conv_acc) if len(conv_acc) > 0 else float("inf"),
-        conv_loss,
-        conv_acc,
-    )
+    return total_loss / batch_count if batch_count > 0 else float("inf")
 
 
 def model_train():
@@ -688,12 +652,10 @@ def model_train():
 
     if len(conv_dfs) == 0:
         print(f"Number of conversations must not be zero")
-        return None, [], []
+        return
 
     # Get the categorical and numerical dimensions they will all be the same throughout the conversations
     cat_dims = conv_dfs[0].cat_dims
-    # Adjust the cat dims conversation number to match the total number of conversations
-    cat_dims[3] = len(conv_dfs)
     numerical_dim = conv_dfs[0].num_dim
 
     # Define the cross entropy loss model and optimizer
@@ -710,8 +672,6 @@ def model_train():
     best_val_loss = float("inf")
     train_losses = list()
     val_losses = list()
-    train_accs = list()
-    val_accs = list()
 
     # Now train over n training epochs
     for epoch in range(N_EPOCHS):
@@ -722,34 +682,21 @@ def model_train():
         # Set the model in training mode
         mqtt_model.train()
         epoch_loss = 0.0
-        epoch_acc = 0.0
         for conv_df in train:
-            results = run_conv(mqtt_model, conv_df, optimizer, criterion, train=True)
-            epoch_loss += results.avg_loss
-            epoch_acc += results.avg_acc
+            conv_loss = train_conv(mqtt_model, conv_df, optimizer, criterion)
+            epoch_loss += conv_loss
         avg_train_loss = epoch_loss / len(conv_dfs)
         train_losses.append(avg_train_loss)
 
-        avg_train_acc = epoch_acc / len(conv_dfs)
-        train_accs.append(avg_train_acc)
-
         # now switch to validation
-        ic("Switching to validation")
         mqtt_model.eval()
         val_loss = 0.0
-        val_acc = 0.0
         with torch.no_grad():
             for conv_df in validation:
-                avg_conv_loss, conv_loss, conv_acc = run_conv(
-                    mqtt_model, conv_df, optimizer, criterion, train=False
-                )
-                val_loss += avg_conv_loss
-                val_acc += results.avg_acc
+                conv_loss = train_conv(mqtt_model, conv_df, optimizer, criterion)
+                val_loss += conv_loss
         avg_val_loss = val_loss / len(conv_dfs)
         val_losses.append(avg_val_loss)
-
-        avg_val_acc = val_acc / len(conv_dfs)
-        val_accs.append(avg_val_acc)
 
         # Model checkpointing
         if avg_val_loss < best_val_loss:
@@ -766,9 +713,9 @@ def model_train():
             )
 
         # Print metrics
-        ic(f"Epoch {epoch+1}/{N_EPOCHS}:")
-        ic(f"  Training Loss: {avg_train_loss:.4f}")
-        ic(f"  Validation Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{N_EPOCHS}:")
+        print(f"  Training Loss: {avg_train_loss:.4f}")
+        print(f"  Validation Loss: {avg_val_loss:.4f}")
 
         # Early stopping check
         if len(val_losses) > PATIENCE:
@@ -776,210 +723,9 @@ def model_train():
                 print("Early stopping triggered")
                 break
 
-    return mqtt_model, train_losses, val_losses, train_accs, val_accs
-
-
-### Helper functions ###
-def get_memory(device: str = DEVICE) -> Dict[str, float]:
-    """
-    @Description: gets the total memory usage in mb for the specified device
-
-    @Notes:
-
-    @Returns: dict of allocated and reserved memory
-    """
-    if device == "cuda":
-        return {
-            "allocated": torch.cuda.memory_allocated(device=device) / 1024**2,
-            "reserved": torch.cuda.memory_reserved(device=device) / 1024**2,
-            "max_reserved": torch.cuda.max_memory_reserved(device=device)
-            / 1024**2,  # Peak usage
-        }
-    else:
-        import psutil
-
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        return {
-            "resident": memory_info.rss / 1024**2,  # Resident Set Size in MB
-            "virtual": memory_info.vms / 1024**2,  # Virtual Memory Size in MB
-        }
-
-
-@dataclass
-class BytePrediction:
-    byte: int
-    prob: float
-    prob_delta: float  # difference between best and second best candidate
-    median_prob: float
-    mean_prob: float
-    std_prob: float
-
-
-def get_preds(logits: torch.Tensor) -> List[BytePrediction]:
-    """
-    @Description: Gets the predicted bytes for logits of shape
-    [batch_size, byte_vocab] along with the following metrics
-        pred: actual value
-        prob: prediciton probability
-
-
-    @Notes:
-
-    @Returns:
-    """
-    if len(logits.shape) == 1:
-        logits = logits.reshape(1, -1)
-
-    n_bytes, byte_dims = logits.shape
-    assert (
-        byte_dims == BYTE_VOCAB_DIM
-    ), f"The logits byte dimmensions {byte_dims} != BYTE_EMBED_DIMS {BYTE_EMBED_DIM}"
-
-    preds = list()
-
-    for byte_pdf in logits:
-        pred = int(byte_pdf.argmax(dim=-1))
-        prob = float(byte_pdf[pred])
-        mask = torch.ones_like(byte_pdf, dtype=torch.bool)
-        mask[pred] = False
-        pred2 = int(byte_pdf[mask].argmax(dim=-1))
-        prob2 = float(byte_pdf[pred2])
-
-        preds.append(
-            BytePrediction(
-                pred,
-                prob,
-                prob - prob2,
-                float(byte_pdf.median(dim=-1).values),
-                float(byte_pdf.mean(dim=-1, dtype=torch.float32)),
-                float(byte_pdf.std(dim=-1)),
-            )
-        )
-
-    return preds
-
-
-def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    """
-    @Description: A percentage indication of how accurate the model is making
-    predictions.
-
-    @Notes:
-        - acc = 0 => perfect predcition
-        - 0.1 < acc < 0.2 => good range
-        - acc > 0.3 => poor preformance
-
-    @Args:
-        logits: torch.Tensor.shape = [n_bytes, byte_dims]
-        targets: torch.Tensor.shape = [n_bytes]
-
-    @Returns: accuracy percentage
-    """
-    total = targets.size(0)
-
-    if total == 0:
-        return 1.0
-
-    preds = get_preds(logits)
-    predictions = logits.argmax(-1)
-    correct = (predictions == targets).sum().item()
-
-    return (correct / total) * 100
-
-
-def print_update(batch_num: int, **kwargs):
-    print(f"\n Train step: {batch_num}")
-    for key, val in kwargs.items():
-        print(f"    {key}: {val}")
-
-    mem_stats = get_memory()
-    for key, value in mem_stats.items():
-        print(f"    {key} memory: {value} MB")
-
-    print()
-
-
-def plot_metrics(
-    loss_data: List[float] | np.ndarray,
-    title: str | None = None,
-    x_label: str = "Batch",
-    y_label: str = "Batch loss",
-):
-    """
-    @Description: Creates a line plot of the loss over time
-
-    @Notes:
-
-    @Returns:
-    """
-    plt.plot(loss_data)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    if title is None:
-        title = f"{y_label} vs {x_label}"
-    plt.title(title)
-    plt.show()
-
-
-def load_model_checkpoint(
-    checkpoint_path: str, cat_dims: list, numerical_dims: int
-) -> Tuple[HierarchicalMQTTModel, torch.optim.Adam, int, List[float], List[float]]:
-    """
-    @Description: This loads the parameters and weights of a HieararhicalMQTTModel
-    from a file so that it can be used for inference or further training
-
-    @Notes:
-
-    @Returns:
-    """
-    assert os.path.exists(
-        checkpoint_path
-    ), f"The checkpoint path {checkpoint_path} does not exist"
-
-    # initialize the model and optimizer
-    model = HierarchicalMQTTModel(
-        categorical_dims=cat_dims, numerical_dim=numerical_dims
-    )
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-    )
-
-    # Now get the model from the saved checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-
-    # Now restore the state
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["model_state_dict"])
-    epoch = checkpoint["epoch"]
-    train_loss = checkpoint["train_loss"]
-    val_loss = checkpoint["val_loss"]
-
-    return model, optimizer, epoch, train_loss, val_loss
+    return mqtt_model, train_losses, val_losses
 
 
 if __name__ == "__main__":
-    # The only thing to do is call the model_train function
-    mqtt_model, train_losses, validation_losses, train_accs, validation_accs = (
-        model_train()
-    )
-
-    plot_metrics(
-        train_losses, "Overall training losses", x_label="Epoch", y_label="Avg loss"
-    )
-    plot_metrics(
-        validation_losses,
-        "Overall validation losses",
-        x_label="Epoch",
-        y_label="Avg loss",
-    )
-
-    plot_metrics(
-        train_acces, "Overall training accs", x_label="Epoch", y_label="Avg acc"
-    )
-    plot_metrics(
-        validation_accs,
-        "Overall validation accs",
-        x_label="Epoch",
-        y_label="Avg acc",
-    )
+    #
+    pass

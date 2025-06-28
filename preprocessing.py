@@ -255,6 +255,7 @@ def extract_features(
     # this is the raw byte data of the mqtt msg. We remove the fixed header
     # which always includes a byte for the flags and then 1 - 4 bytes for the
     # msg length.
+    # in the mqtt len
     ret_vals["mqtt.msg"]["values"] = list(
         [
             np.array(get_byte_list(byte_str)[-1 * mqtt_len :], dtype=np.uint8)

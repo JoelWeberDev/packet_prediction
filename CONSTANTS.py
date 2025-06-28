@@ -66,11 +66,22 @@ MQTT_COMMANDS = [
 ]
 
 ### LSTM model meta parameters ###
-MAX_SEQ_LEN = 128
-BYTE_EMBED_DIM = 128
-BYTE_VOCAB_DIM = 256
+# Defines the different possibilites that we could predict
+SOS = 0x100  # start of sentence token
+NULL = 0x101  # end of sentence token
+N_SPECIAL_TOKNES = 2
+BYTE_VOCAB_DIM = 256 + N_SPECIAL_TOKNES  # number of bytes plus special tokens
+
+# Next packet predictor parameters #
+MAX_SEQ_LEN = (
+    128  # Hard cap on the payload size anything beyond this will get cut short
+)
+CONV_CONTEXT_LEN = 10  # Number of packets in context
+BYTE_CONTEXT_LEN = 10  # Number of current packet bytes to include in the context
+BYTE_EMBED_DIM = 128  # Could be reduced since this is a major source of parameter count
 PACKET_REP_DIM = 256
 CONVERSATIONAL_HIDDEN_DIM = 512
+
 
 PACKET_ENC_LAYERS = 2
 CONVERSATIONAL_LAYERS = 3
@@ -87,7 +98,6 @@ NEXT_PACKET_DROPOUT = 0.2
 TRAIN_VAL_TEST_PERCS = np.array([0.10, 0.15, 0.15])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
-CONV_CONTEXT_LEN = 10  # Number of packets in context
 N_EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3

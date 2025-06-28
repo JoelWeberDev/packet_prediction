@@ -35,19 +35,11 @@ from preprocessing import extract_features, split_into_conversations
 
 
 ### Custom data structures ###
-@dataclass
-class SeqInput:
-    input_bytes: torch.Tensor
-    attention_mask: torch.Tensor
-    input_len: int
-
-    def __str__(self):
-        return f"padded_len: {self.attention_mask.size()} \nactual len: {self.input_len} \ninput bytes: {self.input_bytes[self.attention_mask].tolist()}"
 
 
 @dataclass
 class ParsedPacket:
-    padded_payload: SeqInput
+    padded_payload: torch.Tensor
     cat_names: list
     cat_features: torch.Tensor
     numerical_names: list
@@ -242,10 +234,8 @@ class PacketDataset(Dataset):
                 len(attn_mask) == MAX_SEQ_LEN
             ), f"The sequence length {len(attn_mask)} must equal {MAX_SEQ_LEN}"
 
-            padded_payload = SeqInput(seq, attn_mask, seq_len)
-
             pop = ParsedPacket(
-                padded_payload,
+                torch.tensor(seq),
                 list(self.cat_features.keys()),
                 torch.tensor(list(cat_f), dtype=torch.long),
                 list(self.num_features.keys()),

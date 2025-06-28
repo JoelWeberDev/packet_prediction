@@ -28,6 +28,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Tuple, List, Optional, Iterator
 from dataclasses import dataclass
 from icecream import ic
+from copy import deepcopy
 
 # Local imports
 from CONSTANTS import *
@@ -70,7 +71,7 @@ class Byte:
 @dataclass
 class ByteWithContext:
     target: Byte
-    context: np.ndarray = np.empty(S_BYTE_CTX_LEN, dtype=Byte)
+    context: List[Byte]
 
 
 ### Byte sequence dataset ###
@@ -329,7 +330,7 @@ class ConversationByteStream(Dataset):
                 ), f"The context must have length {S_BYTE_CTX_LEN} not {len(self.context)}"
 
                 byte_with_ctx = ByteWithContext(
-                    parsed_byte, np.array(self.context, dtype=Byte)
+                    parsed_byte, deepcopy(self.context)
                 )
 
                 # Now update the context with the most recent byte

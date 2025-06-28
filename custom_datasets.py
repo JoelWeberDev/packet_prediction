@@ -39,7 +39,7 @@ from preprocessing import extract_features, split_into_conversations
 
 @dataclass
 class ParsedPacket:
-    padded_payload: torch.Tensor
+    payload: torch.Tensor
     cat_names: list
     cat_features: torch.Tensor
     numerical_names: list
@@ -49,7 +49,7 @@ class ParsedPacket:
 
         ret = f"cat_features: {[f'{name}: {value}' for name, value in zip(self.cat_names, self.cat_features.tolist())]}\n"
         ret += f"numerical_features: {[f'{name}: {value}' for name, value in zip(self.numerical_names, self.numerical_features.tolist())]}\n"
-        ret += f"{self.padded_payload}\n"
+        ret += f"{self.payload}\n"
 
         return ret
 
@@ -60,61 +60,17 @@ class PacketWithContext:
     target: ParsedPacket
 
 
-class HistoryQueue:
-    """
-    @Description: Stores the packet history for the model training in a memory
-    safe way that drops the oldest packet once the max size is exceeded. Internally
-    this is implemented using a circular structure and start / end pointers
+@dataclass
+class Byte:
+    value: int
+    cat_features: torch.Tensor
+    numerical_features: torch.Tensor
 
-    @Notes:
-        - Removal is not implemented because it is not needed
 
-    """
-
-    def __init__(self, max_size: int):
-        self.max_size = max_size
-        self.data = list()
-        self.first = 0  # first in
-        self.last = 0  # last in
-
-    def append(self, value):
-        if len(self) == self.max_size:
-            # replace the value at start
-            self.data[self.first] = value
-
-            self.first = self.inc_ptr(self.first)
-            self.last = self.inc_ptr(self.last)
-
-        else:
-            self.data.append(value)
-            self.last = self.inc_ptr(self.last)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        if isinstance(idx, slice):
-            # Handle slicing (e.g., queue[1:5])
-            start = idx.start if idx.start is not None else 0
-            start = max(-1 * len(self), start)
-            start = min(len(self), start) % len(self)
-
-            stop = idx.stop if idx.stop is not None else len(self)
-            stop = max(-1 * len(self), stop)
-            stop = min(len(self), stop) % (len(self) + 1)
-
-            step = idx.step if idx.step is not None else 1
-            return [
-                self.data[(self.first + i) % len(self)]
-                for i in range(start, stop, step)
-            ]
-        else:
-            # Handle single index (e.g., queue[1])
-            return self.data[(self.first + idx) % len(self)]
-
-    ### Helper functions ###
-    def inc_ptr(self, val: int) -> int:
-        return (val + 1) % len(self)
+@dataclass
+class ByteWithContext:
+    target: Byte
+    context: np.ndarray = np.empty(S_BYTE_CTX_LEN, dtype=Byte)
 
 
 ### Byte sequence dataset ###
@@ -139,7 +95,7 @@ class PacketDataset(Dataset):
         self.features = extract_features(df, n_convs=n_convs)
         self.seq_len = seq_len
         self.cnt = 0
-        self.df_len = len(df)
+        self.len = len(df)
         self.history = list()
 
         self._process_packets()
@@ -235,7 +191,7 @@ class PacketDataset(Dataset):
             ), f"The sequence length {len(attn_mask)} must equal {MAX_SEQ_LEN}"
 
             pop = ParsedPacket(
-                torch.tensor(seq),
+                torch.tensor(seq, dtype=torch.long),
                 list(self.cat_features.keys()),
                 torch.tensor(list(cat_f), dtype=torch.long),
                 list(self.num_features.keys()),
@@ -261,6 +217,137 @@ class PacketDataset(Dataset):
             return next(self.packets)
         except StopIteration:
             ic(f"Batches end reached with total count of {self.cnt}")
+            raise StopIteration
+
+    def __len__(self):
+        return self.len
+
+
+class ConversationByteStream(Dataset):
+    """
+    @Description: This goes through and returns the next byte plus metadata in the conversation
+
+    @Notes:
+
+    """
+
+    def __init__(self, df: pd.DataFrame, n_convs: int):
+        self.features = extract_features(df, n_convs=n_convs)
+        self.len = len(df)
+        self.history = list()
+
+        self._process_packets()
+
+    def _process_packets(self):
+        """
+        @Description: Prepares the dimensionality of the dataset
+
+        @Notes:
+
+        @Returns:
+        """
+        # Divide the features into categorical, numerical, and payload
+        self.cat_features = dict()
+        self.num_features = dict()
+        self.seq_features = dict()
+
+        self.cat_dims = list()
+        self.num_dim = 0
+        self.seq_dim = 0
+
+        for name, data in self.features.items():
+            dtype = data["dtype"]
+            values = data["values"]
+            if isinstance(values, np.ndarray):
+                values = values.tolist()
+            if dtype == "categorical":
+                self.cat_features[name] = values
+                self.cat_dims.append(data["dims"])
+            elif dtype == "numerical":
+                self.num_features[name] = values
+                self.num_dim += int(data["dims"])
+            elif dtype == "sequential":
+                self.seq_features[name] = values
+                self.seq_dim += int(data["dims"])
+            else:
+                ic(
+                    f"{name} has unrecognized dtype: {dtype} given for feature, ignoring ..."
+                )
+
+        print(
+            f"cat_dims: {self.cat_dims}, num_dims: {self.num_dim}, seq_dims: {self.seq_dim}"
+        )
+
+        assert (
+            len(self.seq_features) == 1
+        ), f"Currently one and only one sequential feature is permitted, not {len(self.seq_features)}"
+
+        self.bytes = self._packets_to_bytes()
+
+    def _packets_to_bytes(self) -> Iterator[ByteWithContext]:
+        """
+        @Description: Breaks the packets into a byte with context stream ready for the lstm model
+        to do training or inference
+
+        @Notes:
+            - The context leng
+
+        @Returns:
+        """
+        self.context = []
+        self.packet_n = 0
+        self.byte_n = 0
+
+        # Now run through the data
+        for i, (cat_f, num_f, seq_f) in enumerate(
+            zip(
+                zip(*self.cat_features.values()),
+                zip(*self.num_features.values()),
+                zip(*self.seq_features.values()),
+            )
+        ):
+            self.packet_n += 1
+            # Create a Sequence input from the parsed features
+
+            # Add the start of sentence token to the beginning of each sequence
+            seq = [SOS] + seq_f[0]
+
+            for char in seq:
+                self.byte_n += 1
+                parsed_byte = Byte(
+                    char,
+                    torch.tensor(cat_f, dtype=torch.long),
+                    torch.tensor(num_f, dtype=torch.long),
+                )
+
+                if len(self.context) < S_BYTE_CTX_LEN:
+                    self.context.append(parsed_byte)
+                    continue
+
+                assert (
+                    len(self.context) == S_BYTE_CTX_LEN
+                ), f"The context must have length {S_BYTE_CTX_LEN} not {len(self.context)}"
+
+                byte_with_ctx = ByteWithContext(
+                    parsed_byte, np.array(self.context, dtype=Byte)
+                )
+
+                # Now update the context with the most recent byte
+                self.context.append(parsed_byte)
+                self.context = self.context[1:]
+
+                yield byte_with_ctx
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self.bytes)
+        except StopIteration:
+            ic(
+                f"Batches end reached with total packets of {self.packet_n} and total bytes of {self.byte_n}"
+            )
             raise StopIteration
 
     def __len__(self):

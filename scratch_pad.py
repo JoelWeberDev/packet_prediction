@@ -9,31 +9,24 @@ from dataclasses import dataclass
 from CONSTANTS import *
 
 
-t = torch.tensor(list(range(5, 10)) + list(range(3, 9)), dtype=torch.float32)
-print(t)
+def y_fxn():
+    for i in range(10):
+        if i % 3 == 0:
+            yield i
+
+        else:
+            yield list(range(i))
 
 
-vocab_size = 5
-embed_size = 7
-batch_size = 3
-byte_embedding = nn.Embedding(vocab_size, embed_size)
+print(sum(i for i in range(10)))
 
-# Now fabricate some data with shape [batch_size, length]
-test_t = torch.tensor(np.random.randint(0, 5, (batch_size, 8)), dtype=torch.long)
-t2 = torch.zeros((batch_size, 3), dtype=torch.long)
-print(t2)
+s = torch.stack([torch.tensor(range(i, i + 10)) for i in range(5)], dim=0)
+print(s.reshape(-1))
+print(torch.cat([torch.tensor(range(i, i + 10)) for i in range(5)], dim=-1))
 
-t = torch.tensor(list(range(10)))
-for j in range(len(t)):
-    # Now get a context window and pad with null characters
-    # Any target payload that we get passed will begin with the SOS character
-    # Always start at j and fill the rest with nulls
-    byte_context = torch.ones(10, dtype=torch.long) * NULL
-    byte_context[max(10 - j - 1, 0) :] = t[max(j + 1 - 10, 0) : j + 1]
+v1 = 1
+v2 = 2
 
-    print(byte_context)
-
-print(list(range(12))[10:])
 
 
 # class NextPacketPredictor(nn.Module):

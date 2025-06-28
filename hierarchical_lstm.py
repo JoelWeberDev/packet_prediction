@@ -23,6 +23,8 @@
     - How to create an enum in python
     - If I am running the model on an embedded system, what is a reasonable parameter count?
     - Is it worth zeroing out the embeddings for null characters?
+    - Is projecting to eliminate special characters a valid way to include the without letting 
+    the model actually predict them?
 
 
 @TODO:
@@ -95,10 +97,9 @@ class PacketEncoder(nn.Module):
 
     def forward(
         self,
-        byte_sequence,
-        attention_mask,
-        categorical_features,
-        numerical_features,
+        byte_sequence : torch.Tensor,
+        categorical_features : torch.Tensor,
+        numerical_features : torch.Tensor,
     ):
         """
         @Description: Forward pass for the single packet embedding and prediciton LSTM model.
@@ -128,7 +129,7 @@ class PacketEncoder(nn.Module):
         byte_embeds = self.byte_embedding(byte_sequence)  # [batch, seq_len, embed_dim]
 
         # Now pack the embeddings using the attention mask
-        lengths = attention_mask.sum(dim=1).cpu()  # [batch_size]
+        lengths =  (byte_sequence == NULL).sum(dim=1).cpu() # [batch_size]
         packed_embeds = nn.utils.rnn.pack_padded_sequence(
             byte_embeds, lengths, batch_first=True, enforce_sorted=False
         )
@@ -247,11 +248,11 @@ class NextPacketPredictor(nn.Module):
 
         # Output projection on just the 256 bytes excluding the special tokens
         self.output_projection = nn.Linear(
-            CONVERSATIONAL_HIDDEN_DIM, BYTE_VOCAB_DIM - N_SPECIAL_TOKNES
+            CONVERSATIONAL_HIDDEN_DIM, OUTPUT_VOCAB_DIM
         )
 
         # Byte embedding for decoder
-        self.byte_embedding = nn.Embedding(BYTE_VOCAB_DIM, BYTE_EMBED_DIM)
+        self.byte_embedding = nn.Embedding(INT, BYTE_EMBED_DIM)
 
     def forward(
         self,
@@ -294,7 +295,7 @@ class NextPacketPredictor(nn.Module):
             # Training mode - teacher forcing
             return self._train_forward(context, target_payload)
 
-    def _train_forward(self, context, target_payload: torch.Tensor):
+    def _train_forward(self, context: torch.Tensor, target_payload: torch.Tensor):
         """
         @Description: Uses the batch contexts along the prior embedded next packet features
         to predict the entire sequence of next bytes for the target packet.
@@ -323,7 +324,7 @@ class NextPacketPredictor(nn.Module):
         # Repeat context for each timestep in the payload so that we predict byte by byte
         # context_repeated = context.unsqueeze(1).repeat(1, max_len, 1) # [batch_size, max_length, ctx_len]
         lstm_input = torch.zeros(
-            (batch_size, max_len, self.input_size), dtype=torch.long
+            (batch_size, max_len, self.input_size), dtype=torch.long, device=context.device
         )
 
         # initialize the empty lstm input
@@ -385,7 +386,6 @@ class NextPacketPredictor(nn.Module):
         ), f"_generate_payload failed with batch size mismatch {batch_size} != {ctx_batch_size}"
 
         max_len = int(msg_lens.max())
-        pred_payloads = torch.ones((batch_size, max_len), dtype=torch.long) * NULL
 
         padded_pred_payload = torch.cat(
             [
@@ -399,11 +399,18 @@ class NextPacketPredictor(nn.Module):
             dim=-1,
         )
 
+        # Initialize hidden state
+        h = torch.zeros(self.decoder_lstm.num_layers, batch_size, 
+                    self.decoder_lstm.hidden_size, device=context.device)
+        c = torch.zeros(self.decoder_lstm.num_layers, batch_size, 
+                    self.decoder_lstm.hidden_size, device=context.device)
+        hidden_state = (h, c)
+
         for i in range(max_len):
             # Encode only the prior bytes
             byte_embeds = self.byte_embedding(
                 padded_pred_payload[:, i : i + BYTE_CONTEXT_LEN]
-            ).reshape(batch_size, -1)
+            ).reshape(batch_size, -1).to(context.device)
 
             # make a copy of the context for the current timestamp
             context_step = context.unsqueeze(1)  # add another dimension to the tensor
@@ -413,7 +420,7 @@ class NextPacketPredictor(nn.Module):
             )  # [batch_size, full_context_size]
 
             # Get the LSTM output for the given input
-            output, _ = self.decoder_lstm(lstm_input)
+            output, hidden_state = self.decoder_lstm(lstm_input, hidden_state)
 
             logits = self.output_projection(
                 output[:, -1, :]
@@ -421,7 +428,7 @@ class NextPacketPredictor(nn.Module):
             # Select the most likely byte for each
             pred_byte = logits.argmax(dim=-1)
 
-            pred_payloads[:, i + BYTE_CONTEXT_LEN] = pred_byte
+            padded_pred_payload[:, i + BYTE_CONTEXT_LEN] = pred_byte
 
         # Now create attention mask for each msg length
         attn_masks = torch.tensor(
@@ -433,7 +440,7 @@ class NextPacketPredictor(nn.Module):
         return [
             payload[attn_mask]
             for payload, attn_mask in zip(
-                pred_payloads[:, BYTE_CONTEXT_LEN:], attn_masks
+                padded_pred_payload[:, BYTE_CONTEXT_LEN:], attn_masks
             )
         ]
 
@@ -491,14 +498,13 @@ class HierarchicalMQTTModel(nn.Module):
             packet = conversation_packets[:, i]  # [batch_size, 1]
 
             # extract the individual elements from each packets
-            payload = torch.stack([p.padded_payload.input_bytes for p in packet])
-            attn_mask = torch.stack([p.padded_payload.attention_mask for p in packet])
+            payload = torch.stack([p.payload for p in packet])
             cat_feats = torch.stack([p.cat_features for p in packet])
             numerical_feats = torch.stack([p.numerical_features for p in packet])
 
             # TODO: Test how this is encoded
             packet_repr = self.packet_encoder(
-                payload, attn_mask, cat_feats, numerical_feats
+                payload, cat_feats, numerical_feats
             )
             packet_representations.append(packet_repr)
 

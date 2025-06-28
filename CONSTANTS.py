@@ -70,7 +70,9 @@ MQTT_COMMANDS = [
 SOS = 0x100  # start of sentence token
 NULL = 0x101  # end of sentence token
 N_SPECIAL_TOKNES = 2
-BYTE_VOCAB_DIM = 256 + N_SPECIAL_TOKNES  # number of bytes plus special tokens
+OUTPUT_VOCAB_DIM = 256
+INPUT_VOCAB_DIM = OUTPUT_VOCAB_DIM + N_SPECIAL_TOKNES
+# BYTE_VOCAB_DIM = 256 + N_SPECIAL_TOKNES  # number of bytes plus special tokens
 
 # Next packet predictor parameters #
 MAX_SEQ_LEN = (
@@ -108,3 +110,16 @@ ic(f"Using device type: {DEVICE}")
 PATIENCE = 5  # minimum early stopping epochs
 CHECKPOINT_DIR = "checkpoints"
 DEBUG_MODE = False
+
+
+### Simple lstm model params ###
+S_BYTE_CTX_LEN = 32
+S_HIDDEN_SIZE = 512
+S_LSTM_LAYERS = 3
+S_LSTM_DROPOUT = 0.2
+
+### Magic numbers ###
+CAT_EMB_SCALAR = 1.6
+CAT_EMB_EXPO = 0.56
+MAX_CAT_EMB = 50
+

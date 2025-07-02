@@ -12,8 +12,6 @@ SOS token is reached.
     - The cell and hidden states must be explicitly preserved throughout calls.
 
 @TODO:
-    - Create embedding for the categorical and numerical features
-    - Construct a context embedder
     - Make an autoregressive training process that batches the sequences up into fixed lengths
     and preserves cell and hidden states for each batch.
 
@@ -32,6 +30,7 @@ from dataclasses import dataclass
 from preprocessing import load_df, split_into_conversations
 from custom_datasets import ConversationByteStream, Byte, ByteWithContext
 from CONSTANTS import *
+from helper_functions import ConvResults, get_memory, print_update, plot_metrics
 
 
 # Next byte predictor
@@ -57,7 +56,7 @@ class NextBytePredictor(nn.Module):
         super().__init__()
 
         # Used to embed a single byte or generate a tensor of embeddings for a tensor of bytes
-        self.byte_embedding = nn.Embedding(INPUT_VOCAB_DIM, BYTE_EMBED_DIM)
+        self.byte_embedding = nn.Embedding(VOCAB_DIM, BYTE_EMBED_DIM)
 
         def get_embedding_dim(n_cats: int) -> int:
             # Google's categorical embedding formuala
@@ -80,17 +79,27 @@ class NextBytePredictor(nn.Module):
             BYTE_EMBED_DIM + self.cat_embed_dim + self.numerical_embed_dim
         )
 
+        # Add layer normalization
+        self.layer_norm = nn.LayerNorm(S_HIDDEN_SIZE)
+
+        # Add residual connections
+        self.residual_projection = nn.Linear(self.input_size, S_HIDDEN_SIZE)
+
         # Now create the acutal LSTM for inference
         self.next_byte_lstm = nn.LSTM(
             input_size=self.input_size,
-            hidden_size=S_HIDDEN_SIZE,
+            hidden_size=S_HIDDEN_SIZE // 2,
             num_layers=S_LSTM_LAYERS,
             batch_first=True,
             dropout=S_LSTM_DROPOUT,
+            bidirectional=True,
         )
 
+        self.input_dropout = nn.Dropout(S_LSTM_DROPOUT)
+        self.hidden_dropout = nn.Dropout(S_LSTM_DROPOUT)
+
         # Now create the output projector
-        self.output_projection = nn.Linear(S_HIDDEN_SIZE, OUTPUT_VOCAB_DIM)
+        self.output_projection = nn.Linear(S_HIDDEN_SIZE, VOCAB_DIM)
 
         self.device = device
         self.to(device=device)
@@ -121,33 +130,22 @@ class NextBytePredictor(nn.Module):
         # Create the embeddings for each of the byte context objects
         embedded_inputs = torch.stack(
             [self._embed_byte_context(byte_with_ctx) for byte_with_ctx in input_batch],
-            dim=1,
+            dim=0,
         ).to(self.device)
 
-        # Now run the next byte prediction lstm
-        hidden_states = (
-            torch.zeros((batch_size, S_HIDDEN_SIZE), dtype=torch.long)
-            if hidden_states is None
-            else hidden_states
-        )
-        assert hidden_states.shape == (
-            batch_size,
-            S_HIDDEN_SIZE,
-        ), f"The hidden states must have shape {(batch_size, S_HIDDEN_SIZE)}, not {hidden_states.shape}"
+        embedded_inputs = self.input_dropout(embedded_inputs)
 
-        cell_states = (
-            torch.zeros((batch_size, S_HIDDEN_SIZE), dtype=torch.long)
-            if cell_states is None
-            else cell_states
+        hidden = (
+            None
+            if (hidden_states is None) or (cell_states is None)
+            else (hidden_states, cell_states)
         )
-        assert cell_states.shape == (
-            batch_size,
-            S_HIDDEN_SIZE,
-        ), f"The cell states must have shape {(batch_size, S_HIDDEN_SIZE)}, not {cell_states.shape}"
 
         byte_outputs, (hidden_states, cell_states) = self.next_byte_lstm(
-            embedded_inputs, (hidden_states, cell_states)
+            embedded_inputs, hidden
         )
+
+        byte_outputs = self.hidden_dropout(byte_outputs)
 
         assert isinstance(hidden_states, torch.Tensor) and isinstance(
             cell_states, torch.Tensor
@@ -167,16 +165,21 @@ class NextBytePredictor(nn.Module):
         """
         cat_emb_list = list()
         for i, cat_emb_layer in enumerate(self.cat_embeddings):
-            cat_emb_list.append(cat_emb_layer(byte.cat_features[i]))
+            cat_emb_list.append(cat_emb_layer(byte.cat_features[i].to(self.device)))
         cat_embs = (
             torch.cat(cat_emb_list, dim=-1)
             if cat_emb_list
             else torch.empty(0, dtype=torch.long)
         )
 
-        byte_emb = self.byte_embedding(byte.value)
+        byte_emb = self.byte_embedding(
+            torch.tensor([byte.value], dtype=torch.long).to(self.device)
+        )
 
-        return torch.cat([byte_emb, cat_embs, byte.numerical_features], dim=-1)
+        return torch.cat(
+            [byte_emb.view(-1), cat_embs, byte.numerical_features.to(self.device)],
+            dim=-1,
+        )
 
     def _embed_byte_context(self, byte_with_ctx: ByteWithContext) -> torch.Tensor:
         """
@@ -232,35 +235,42 @@ def train_step(
 
     @Returns:
     """
+    optimizer.zero_grad()
     batch_size = len(batch)
 
-    logits = torch.zeros((batch_size, OUTPUT_VOCAB_DIM), dtype=torch.long)
+    logits = torch.zeros((batch_size, VOCAB_DIM), dtype=torch.float32)
     actual = torch.zeros(batch_size, dtype=torch.long)
     correct_cnt = 0
 
     for i, byte_with_ctx in enumerate(batch):
         # must be managed sequentially since we depend on state progression
         pred_logits, hidden_states, cell_states = model.forward(
-            [byte_with_ctx], hidden_states=hidden_states, cell_states=cell_states
+            [byte_with_ctx],
+            hidden_states=hidden_states.detach() if hidden_states is not None else None,
+            cell_states=cell_states.detach() if cell_states is not None else None,
         )
 
         # Compare the predicted byte to the sequential one
-        logits[i, :] = pred_logits.argmax(dim=-1)
-        actual[i] = torch.tensor(byte_with_ctx.target, dtype=torch.long)
+        logits[i, :] = pred_logits
+        actual[i] = torch.tensor(byte_with_ctx.target.value, dtype=torch.long)
 
+        print(f"predicted: {pred_logits.argmax(-1)} actual: {actual[i]}")
         if pred_logits.argmax(-1) == actual[i]:
             correct_cnt += 1
 
-    # Now compute the loss and make 
+    # Now compute the loss and make
     loss = criterion(logits, actual)
 
     # Backprop step
     loss.backward()
+    # Add gradient clipping before optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
-    acc = correct_cnt / batch_size if batch_size else float('inf')
+    acc = correct_cnt / batch_size if batch_size else float("inf")
 
     return loss.item(), acc, hidden_states, cell_states
+
 
 def generate_step(
     model: NextBytePredictor,
@@ -268,19 +278,21 @@ def generate_step(
     target_seq_len: int,
     hidden_states: torch.Tensor | None = None,
     cell_states: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """
     @Description: Autoregressively generates a sequence of bytes
-    
-    @Notes: 
+
+    @Notes:
         - We keep the categorical and numerical features the same for the predictions
-        - We ignore the target byte given in the ByteWithContext it is really only 
-    
+        - We use the categorical and numerical features for the target byte as the features
+        for the entire sequence
+
     @Returns: Tuple(logits, hidden, cell)
     """
-    context = cur_byte.context
+    cat_f = cur_byte.target.cat_features
+    num_f = cur_byte.target.numerical_features
 
-    logits = torch.zeros((target_seq_len, OUTPUT_VOCAB_DIM), dtype=torch.long)
+    logits = torch.zeros((target_seq_len, VOCAB_DIM), dtype=torch.float32)
 
     for i in range(target_seq_len):
         # must be managed sequentially since we depend on state progression
@@ -289,21 +301,14 @@ def generate_step(
         )
 
         # Compare the predicted byte to the sequential one
-        logits[i, :] = pred_logits.argmax(dim=-1)
-        # STOPPING POINT: Need to complete sequence generation
+        logits[i, :] = pred_logits
 
-    return hidden_states, cell_states
-    
+        # Add the predicted byte to the context
+        pred_byte = Byte(int(pred_logits.argmax(dim=-1)), cat_f, num_f)
+        cur_byte.context.append(pred_byte)
+        cur_byte.context = cur_byte.context[(-1) * S_BYTE_CTX_LEN :]
 
-
-@dataclass
-class ConvResults:
-    avg_loss: float
-    avg_acc: float
-    conv_loss: List[float]
-    conv_acc: List[float]
-    hidden_states: torch.Tensor | None
-    cell_states: torch.Tensor | None
+    return logits, hidden_states, cell_states
 
 
 def run_conv(
@@ -329,30 +334,66 @@ def run_conv(
 
     # Go through the packets by batch size and perform the training step for each batch
     while True:
+
         batch = list()
-        for _ in range(BATCH_SIZE):
-            try:
-                batch.append(next(conv_df))
-            except StopIteration:
+        # Process batch
+        if train:
+            for _ in range(BATCH_SIZE):
+                try:
+                    batch.append(next(conv_df))
+                except StopIteration:
+                    break
+
+            if len(batch) == 0:
                 break
 
-        if len(batch) == 0:
-            break
+            loss, acc, hidden_states, cell_states = train_step(
+                model,
+                batch,
+                optimizer,
+                criterion,
+                hidden_states=hidden_states,
+                cell_states=cell_states,
+            )
 
-        # Process batch
-        loss, acc, hidden_state, cell_state = forward_step(
-            model,
-            batch,
-            optimizer,
-            criterion,
-            train=train,
-            hidden_states=hidden_states,
-            cell_states=cell_states,
-        )
-        batch_num += 1
+        else:
+            # Get the initial SOS byte and the rest of the payload bytes
+            # batch = [SOS, rest of message]
+            try:
+                start_byte = next(conv_df)
+                while start_byte.target.value != SOS:
+                    start_byte = next(conv_df)
+                    batch.append(start_byte)
+
+            except StopIteration:
+                pass
+
+            if len(batch) == 0:
+                break
+
+            logits, hidden_states, cell_states = generate_step(
+                model,
+                batch[0],
+                len(batch),
+                hidden_states=hidden_states,
+                cell_states=cell_states,
+            )  # logits.shape = [batch_size, vocab_dim]
+
+            # Generate the list of target bytes
+            targets = torch.tensor(
+                [byte_with_ctx.target.value for byte_with_ctx in batch],
+                dtype=torch.long,
+            )
+
+            loss = criterion(logits, targets).item()
+            correct_cnt = int((logits.argmax(dim=-1) == targets).sum(-1))
+            acc = correct_cnt / len(
+                batch
+            )  # If we are this far batch size will not be zero
 
         conv_loss.append(loss)
         conv_acc.append(acc)
+        batch_num += 1
 
         if DEBUG_MODE:
 
@@ -387,7 +428,9 @@ def run_conv(
     )
 
 
-def model_train():
+def model_train() -> (
+    Tuple[NextBytePredictor | None, List[float], List[float], List[float], List[float]]
+):
     # Get the dataset for the conversation data
     df = load_df()
 
@@ -400,7 +443,7 @@ def model_train():
 
     if len(conv_dfs) == 0:
         print(f"Number of conversations must not be zero")
-        return None, [], []
+        return None, [], [], [], []
 
     # Get the categorical and numerical dimensions they will all be the same throughout the conversations
     cat_dims = conv_dfs[0].cat_dims
@@ -435,6 +478,7 @@ def model_train():
         byte_predictor.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
+
         for conv_df in train:
             results = run_conv(
                 byte_predictor, conv_df, optimizer, criterion, train=True
@@ -453,6 +497,7 @@ def model_train():
         byte_predictor.eval()
         val_loss = 0.0
         val_acc = 0.0
+
         with torch.no_grad():
             for conv_df in validation:
                 results = run_conv(
@@ -460,6 +505,7 @@ def model_train():
                 )
                 val_loss += results.avg_loss
                 val_acc += results.avg_acc
+
         avg_val_loss = val_loss / len(conv_dfs)
         val_losses.append(avg_val_loss)
 
@@ -491,34 +537,10 @@ def model_train():
                 ic("Early stopping triggered")
                 break
 
-    return mqtt_model, train_losses, val_losses, train_accs, val_accs
+    return byte_predcitor, train_losses, val_losses, train_accs, val_accs
 
 
 ### Helper functions ###
-def get_memory(device: str = DEVICE) -> Dict[str, float]:
-    """
-    @Description: gets the total memory usage in mb for the specified device
-
-    @Notes:
-
-    @Returns: dict of allocated and reserved memory
-    """
-    if device == "cuda":
-        return {
-            "allocated": torch.cuda.memory_allocated(device=device) / 1024**2,
-            "reserved": torch.cuda.memory_reserved(device=device) / 1024**2,
-            "max_reserved": torch.cuda.max_memory_reserved(device=device)
-            / 1024**2,  # Peak usage
-        }
-    else:
-        import psutil
-
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        return {
-            "resident": memory_info.rss / 1024**2,  # Resident Set Size in MB
-            "virtual": memory_info.vms / 1024**2,  # Virtual Memory Size in MB
-        }
 
 
 @dataclass
@@ -548,7 +570,7 @@ def get_preds(logits: torch.Tensor) -> List[BytePrediction]:
 
     n_bytes, byte_dims = logits.shape
     assert (
-        byte_dims == BYTE_VOCAB_DIM
+        byte_dims == VOCAB_DIM
     ), f"The logits byte dimmensions {byte_dims} != BYTE_EMBED_DIMS {BYTE_EMBED_DIM}"
 
     preds = list()
@@ -596,50 +618,16 @@ def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     if total == 0:
         return 1.0
 
-    preds = get_preds(logits)
+    # preds = get_preds(logits)
     predictions = logits.argmax(-1)
     correct = (predictions == targets).sum().item()
 
     return (correct / total) * 100
 
 
-def print_update(batch_num: int, **kwargs):
-    print(f"\n Train step: {batch_num}")
-    for key, val in kwargs.items():
-        print(f"    {key}: {val}")
-
-    mem_stats = get_memory()
-    for key, value in mem_stats.items():
-        print(f"    {key} memory: {value} MB")
-
-    print()
-
-
-def plot_metrics(
-    loss_data: List[float] | np.ndarray,
-    title: str | None = None,
-    x_label: str = "Batch",
-    y_label: str = "Batch loss",
-):
-    """
-    @Description: Creates a line plot of the loss over time
-
-    @Notes:
-
-    @Returns:
-    """
-    plt.plot(loss_data)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    if title is None:
-        title = f"{y_label} vs {x_label}"
-    plt.title(title)
-    plt.show()
-
-
 def load_model_checkpoint(
-    checkpoint_path: str, cat_dims: list, numerical_dims: int
-) -> Tuple[HierarchicalMQTTModel, torch.optim.Adam, int, List[float], List[float]]:
+    checkpoint_path: str, cat_dims: List[int], numerical_dims: int
+) -> Tuple[NextBytePredictor, torch.optim.Adam, int, List[float], List[float]]:
     """
     @Description: This loads the parameters and weights of a HieararhicalMQTTModel
     from a file so that it can be used for inference or further training
@@ -653,9 +641,7 @@ def load_model_checkpoint(
     ), f"The checkpoint path {checkpoint_path} does not exist"
 
     # initialize the model and optimizer
-    model = HierarchicalMQTTModel(
-        categorical_dims=cat_dims, numerical_dim=numerical_dims
-    )
+    model = NextBytePredictor(cat_dims=cat_dims, numerical_dims=numerical_dims)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
@@ -675,7 +661,7 @@ def load_model_checkpoint(
 
 if __name__ == "__main__":
     # The only thing to do is call the model_train function
-    mqtt_model, train_losses, validation_losses, train_accs, validation_accs = (
+    byte_predcitor, train_losses, validation_losses, train_accs, validation_accs = (
         model_train()
     )
 
@@ -690,7 +676,7 @@ if __name__ == "__main__":
     )
 
     plot_metrics(
-        train_acces, "Overall training accs", x_label="Epoch", y_label="Avg acc"
+        train_accs, "Overall training accs", x_label="Epoch", y_label="Avg acc"
     )
     plot_metrics(
         validation_accs,

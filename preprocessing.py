@@ -258,7 +258,11 @@ def extract_features(
     # in the mqtt len
     ret_vals["mqtt.msg"]["values"] = list(
         [
-            np.array(get_byte_list(byte_str)[-1 * mqtt_len :], dtype=np.uint8)
+            (
+                np.array(get_byte_list(byte_str)[-1 * mqtt_len :], dtype=np.uint8)
+                if mqtt_len > 0
+                else np.array([], dtype=np.uint8)
+            )
             for mqtt_len, byte_str in zip(df["mqtt.len"], df["tcp.payload"])
         ]
     )

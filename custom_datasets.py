@@ -27,8 +27,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, Tuple, List, Optional, Iterator
 from dataclasses import dataclass
-from icecream import ic
 from copy import deepcopy
+from icecream import ic
 
 # Local imports
 from CONSTANTS import *
@@ -53,12 +53,6 @@ class ParsedPacket:
         ret += f"{self.payload}\n"
 
         return ret
-
-
-@dataclass
-class PacketWithContext:
-    context: List[ParsedPacket]
-    target: ParsedPacket
 
 
 @dataclass
@@ -147,7 +141,7 @@ class PacketDataset(Dataset):
 
         self.packets = self._parse_packets()
 
-    def _parse_packets(self) -> Iterator[PacketWithContext]:
+    def _parse_packets(self) -> Iterator[ParsedPacket]:
         """
         @Description: Parses the data frame into a packets with context that are suitable for
         training and inference
@@ -166,30 +160,7 @@ class PacketDataset(Dataset):
         ):
             self.cnt += 1
             # Create a Sequence input from the parsed features
-            seq = seq_f[0]
-            seq_len = len(seq)
-            # Now pad the sequence
-            if seq_len > MAX_SEQ_LEN:
-                # We simply lose data here
-                seq = seq[:MAX_SEQ_LEN]
-                seq_len = MAX_SEQ_LEN
-
-            elif len(seq) < MAX_SEQ_LEN:
-                seq = torch.tensor(
-                    seq.tolist() + [0] * (MAX_SEQ_LEN - seq_len), dtype=torch.long
-                )
-
-            attn_mask = torch.tensor(
-                ([1] * seq_len) + ([0] * (MAX_SEQ_LEN - seq_len)), dtype=torch.bool
-            )
-
-            assert (
-                len(seq) == MAX_SEQ_LEN
-            ), f"The sequence length {len(seq)} must equal {MAX_SEQ_LEN}"
-
-            assert (
-                len(attn_mask) == MAX_SEQ_LEN
-            ), f"The sequence length {len(attn_mask)} must equal {MAX_SEQ_LEN}"
+            seq = [SOS] + seq_f[0].tolist()
 
             pop = ParsedPacket(
                 torch.tensor(seq, dtype=torch.long),
@@ -199,16 +170,7 @@ class PacketDataset(Dataset):
                 torch.tensor(list(num_f), dtype=torch.long),
             )
 
-            if i < CONV_CONTEXT_LEN:
-                self.history.append(pop)
-                continue
-
-            # slice for most recent history
-            ret = PacketWithContext(self.history.copy(), pop)
-            self.history.append(pop)
-            self.history = self.history[-CONV_CONTEXT_LEN:]
-
-            yield ret
+            yield pop
 
     def __iter__(self):
         return self
@@ -311,7 +273,10 @@ class ConversationByteStream(Dataset):
             # Create a Sequence input from the parsed features
 
             # Add the start of sentence token to the beginning of each sequence
-            seq = [SOS] + seq_f[0]
+            seq = [SOS] + seq_f[0].tolist()
+            assert (len(seq) - 1) == num_f[
+                2
+            ], f"The mqtt.len  {num_f[2]} != actual length {(len(seq) - 1)}"
 
             for char in seq:
                 self.byte_n += 1
@@ -329,9 +294,7 @@ class ConversationByteStream(Dataset):
                     len(self.context) == S_BYTE_CTX_LEN
                 ), f"The context must have length {S_BYTE_CTX_LEN} not {len(self.context)}"
 
-                byte_with_ctx = ByteWithContext(
-                    parsed_byte, deepcopy(self.context)
-                )
+                byte_with_ctx = ByteWithContext(parsed_byte, deepcopy(self.context))
 
                 # Now update the context with the most recent byte
                 self.context.append(parsed_byte)
@@ -342,7 +305,7 @@ class ConversationByteStream(Dataset):
     def __iter__(self):
         return self
 
-    def __next__(self):
+    def __next__(self) -> ByteWithContext:
         try:
             return next(self.bytes)
         except StopIteration:
@@ -353,6 +316,41 @@ class ConversationByteStream(Dataset):
 
     def __len__(self):
         return self.len
+
+
+class ByteStream(Dataset):
+    def __init__(self, df: pd.DataFrame):
+        self.features = extract_features(df, n_convs=0)
+        self.history = list()
+        self.byte_cnt = 0
+
+        self.byte_stream = self._create_byte_stream()
+
+    def _create_byte_stream(self) -> Iterator[int]:
+        sequences = self.features["mqtt.msg"]["values"]
+
+        for seq in sequences:
+            # add the SOS byte to the start of each sequence
+            if isinstance(seq, np.ndarray):
+                seq = [SOS] + seq.tolist()
+            elif isinstance(seq, list):
+                seq = [SOS] + seq
+            else:
+                raise Exception(f"Cannot create sequence from type {type(seq)}")
+
+            for byte in seq:
+                self.byte_cnt += 1
+                yield int(byte)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        try:
+            return next(self.byte_stream)
+        except StopIteration:
+            ic(f"Batches end reached with {self.byte_cnt} total bytes")
+            raise StopIteration
 
 
 if __name__ == "__main__":

@@ -68,10 +68,10 @@ MQTT_COMMANDS = [
 ### LSTM model meta parameters ###
 # Defines the different possibilites that we could predict
 SOS = 0x100  # start of sentence token
-NULL = 0x101  # end of sentence token
-N_SPECIAL_TOKNES = 2
-OUTPUT_VOCAB_DIM = 256
-INPUT_VOCAB_DIM = OUTPUT_VOCAB_DIM + N_SPECIAL_TOKNES
+# NULL = 0x101  # padding token
+N_SPECIAL_TOKNES = 1
+# OUTPUT_VOCAB_DIM = 256
+VOCAB_DIM = 256 + N_SPECIAL_TOKNES
 # BYTE_VOCAB_DIM = 256 + N_SPECIAL_TOKNES  # number of bytes plus special tokens
 
 # Next packet predictor parameters #
@@ -97,7 +97,7 @@ CONV_LSTM_DROPOUT = 0.3
 NEXT_PACKET_DROPOUT = 0.2
 
 ### Training parameters ###
-TRAIN_VAL_TEST_PERCS = np.array([0.10, 0.15, 0.15])
+TRAIN_VAL_TEST_PERCS = np.array([0.70, 0.15, 0.15])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
 N_EPOCHS = 10
@@ -117,9 +117,20 @@ S_BYTE_CTX_LEN = 32
 S_HIDDEN_SIZE = 512
 S_LSTM_LAYERS = 3
 S_LSTM_DROPOUT = 0.2
+S_TEMPERATURE = 1.0
 
 ### Magic numbers ###
 CAT_EMB_SCALAR = 1.6
 CAT_EMB_EXPO = 0.56
 MAX_CAT_EMB = 50
 
+
+### Primitive next byte predictor ###
+P_CTX_LEN = 32
+P_HIDDEN_SIZE = 512
+P_NUM_LAYERS = 3
+P_DROPOUT = 0.2
+P_BATCH_SIZE = 20
+P_LEARNING_RATE = 5e-4
+P_WEIGHT_DECAY = 1e-5
+WINDOW_REFRESH_CNT = 32

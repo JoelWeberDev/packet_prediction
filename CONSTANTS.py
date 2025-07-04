@@ -109,7 +109,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ic(f"Using device type: {DEVICE}")
 PATIENCE = 5  # minimum early stopping epochs
 CHECKPOINT_DIR = "checkpoints"
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 
 ### Simple lstm model params ###
@@ -134,3 +134,10 @@ P_BATCH_SIZE = 20
 P_LEARNING_RATE = 5e-4
 P_WEIGHT_DECAY = 1e-5
 WINDOW_REFRESH_CNT = 32
+P_SMOOTHING = 0.1
+
+
+P_METADATA_DROPOUT = 0.5
+P_METADATA_HIDDEN_DIM = 64
+P_METADATA_OUTPUT_DIM = 32
+P_METADATA_SCALE = 0.02

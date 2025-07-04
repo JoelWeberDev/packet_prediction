@@ -11,57 +11,12 @@ from CONSTANTS import *
 
 t = torch.tensor(list(range(10)), dtype=torch.long)
 
-embedder = nn.Embedding(VOCAB_DIM, BYTE_EMBED_DIM)
+expnd = t.unsqueeze(0).expand(12, -1)
 
-bytes = torch.tensor(
-    [
-        256,
-        0,
-        4,
-        77,
-        81,
-        84,
-        84,
-        4,
-        2,
-        0,
-        60,
-        0,
-        23,
-        48,
-        56,
-        48,
-        98,
-        52,
-        54,
-        49,
-        56,
-        55,
-        97,
-        50,
-        102,
-        52,
-        100,
-        51,
-        50,
-        98,
-        53,
-        49,
-    ],
-    dtype=torch.long,
-)
+other = torch.zeros((12, 7), dtype=torch.long)
 
-embs = embedder(bytes).reshape(1, -1)
+# print(t)
 
-print(embs.shape)
+cmb = torch.cat([other, expnd], dim=-1)
 
-print(t.tolist())
-
-l = [1, 2, 3]
-l2 = list()
-
-l2.append(torch.tensor(l))
-
-l.append(4)
-
-print(l2[0])
+print(cmb)

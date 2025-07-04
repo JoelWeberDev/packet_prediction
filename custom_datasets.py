@@ -40,7 +40,7 @@ from preprocessing import extract_features, split_into_conversations
 
 @dataclass
 class ParsedPacket:
-    payload: torch.Tensor
+    payload: List[int]
     cat_names: list
     cat_features: torch.Tensor
     numerical_names: list
@@ -86,9 +86,8 @@ class PacketDataset(Dataset):
             [frame.number, frame.time_delta, mqtt.len]
     """
 
-    def __init__(self, df: pd.DataFrame, n_convs: int, seq_len: int = MAX_SEQ_LEN):
+    def __init__(self, df: pd.DataFrame, n_convs: int):
         self.features = extract_features(df, n_convs=n_convs)
-        self.seq_len = seq_len
         self.cnt = 0
         self.len = len(df)
         self.history = list()
@@ -109,8 +108,8 @@ class PacketDataset(Dataset):
         self.seq_features = dict()
 
         self.cat_dims = list()
-        self.num_dim = 0
-        self.seq_dim = 0
+        self.num_dims = 0
+        self.seq_dims = 0
 
         for name, data in self.features.items():
             dtype = data["dtype"]
@@ -122,17 +121,17 @@ class PacketDataset(Dataset):
                 self.cat_dims.append(data["dims"])
             elif dtype == "numerical":
                 self.num_features[name] = values
-                self.num_dim += data["dims"]
+                self.num_dims += data["dims"]
             elif dtype == "sequential":
                 self.seq_features[name] = values
-                self.seq_dim += data["dims"]
+                self.seq_dims += data["dims"]
             else:
                 ic(
                     f"{name} has unrecognized dtype: {dtype} given for feature, ignoring ..."
                 )
 
         print(
-            f"cat_dims: {self.cat_dims}, num_dims: {self.num_dim}, seq_dims: {self.seq_dim}"
+            f"cat_dims: {self.cat_dims}, num_dims: {self.num_dims}, seq_dims: {self.seq_dims}"
         )
 
         assert (
@@ -160,10 +159,9 @@ class PacketDataset(Dataset):
         ):
             self.cnt += 1
             # Create a Sequence input from the parsed features
-            seq = [SOS] + seq_f[0].tolist()
 
             pop = ParsedPacket(
-                torch.tensor(seq, dtype=torch.long),
+                seq_f[0].tolist(),
                 list(self.cat_features.keys()),
                 torch.tensor(list(cat_f), dtype=torch.long),
                 list(self.num_features.keys()),

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Splits a large file into smaller files by line number
 
-MAX_LC=100000
+# MAX_LC=100000
+MAX_LC=50000
 
 file_path="$(realpath $1)"
 ext="${file_path##*.}"

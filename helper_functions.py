@@ -15,11 +15,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Iterator
 from dataclasses import dataclass
 
 ### Local imports ###
 from CONSTANTS import *
+from preprocessing import load_df
 
 
 ### Custom data classes ###
@@ -31,6 +32,14 @@ class ConvResults:
     conv_acc: List[float]
     hidden_states: torch.Tensor | None
     cell_states: torch.Tensor | None
+
+
+@dataclass
+class EpochResults:
+    avg_train_loss: float = float("inf")
+    avg_train_acc: float = 0.0
+    avg_val_loss: float = float("inf")
+    avg_val_acc: float = 0.0
 
 
 ### Custom helper functions ###
@@ -92,3 +101,4 @@ def plot_metrics(
         title = f"{y_label} vs {x_label}"
     plt.title(title)
     plt.show()
+

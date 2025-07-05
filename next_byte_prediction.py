@@ -21,6 +21,7 @@ couple propositions about how to use meta data:
 """
 
 ### Python imports ###
+import sys, os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -30,10 +31,16 @@ from typing import List, Dict, Tuple
 from dataclasses import dataclass
 
 ### Local imports ###
-from preprocessing import load_df, split_into_conversations
+from preprocessing import load_df, split_into_conversations, load_dfs_from_dir
 from custom_datasets import ByteStream, PacketDataset
 from CONSTANTS import *
-from helper_functions import ConvResults, get_memory, print_update, plot_metrics
+from helper_functions import (
+    ConvResults,
+    EpochResults,
+    get_memory,
+    print_update,
+    plot_metrics,
+)
 
 
 ### Custom loss functions ###
@@ -154,6 +161,18 @@ class NextByteLSTM(nn.Module):
         input_emb = self.input_norm(torch.cat([ctx_embeds, meta_rep], dim=-1))
 
         output, (hx, cx) = self.next_byte_predictor(input_emb, self.hidden)
+
+        # Compute the net difference between the internal states
+        if False and self.hidden is not None:
+            h_diffs = torch.abs((hx - self.hidden[0]))
+            print(
+                f"\nh_diff mean: {torch.mean(h_diffs)}, h_diff_median: {torch.median(h_diffs)}"
+            )
+            c_diffs = torch.abs((cx - self.hidden[1]))
+            print(
+                f"c_diff mean: {torch.mean(c_diffs)}, c_diff_median: {torch.median(c_diffs)}\n"
+            )
+
         self.hidden = (hx.detach(), cx.detach())
 
         logits = self.project_outputs(output)
@@ -163,27 +182,108 @@ class NextByteLSTM(nn.Module):
 
 if __name__ == "__main__":
 
+    ### Cross function variables ###
+    conv_list = list()
+    split_dict = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
+
     ### Helper functions ###
-    def split_convs(
-        conv_dfs: List[PacketDataset],
-    ) -> Dict[str, List[PacketDataset]]:
-        train_idx = int(TRAIN_VAL_TEST_PERCS[0] * len(conv_dfs))
-        val_idx = int(TRAIN_VAL_TEST_PERCS[1] * len(conv_dfs))
+    def update_split_dict():
+        n_convs = len(conv_list)
+        n_in_dict = np.sum([len(elem) for elem in split_dict.values()])
+        # Number of values to add for each category
+        n_train = int(TRAIN_VAL_TEST_PERCS[0] * n_convs) - len(split_dict["train"])
+        n_val = int(TRAIN_VAL_TEST_PERCS[1] * n_convs) - len(split_dict["val"])
+        n_test = n_convs - n_val - n_train - len(split_dict["test"])
+
+        # Now get how many are already in the split dict
+        new_conv_nums = list(range(n_in_dict, n_in_dict + n_train + n_val + n_test))
+        for key, n_nums in zip(split_dict.keys(), (n_train, n_val, n_test)):
+            for _ in range(n_nums):
+                # We randomly choose which category each conversation nubmer should go to
+                conv_num = new_conv_nums.pop(np.random.randint(0, len(new_conv_nums)))
+                split_dict[key].append(conv_num)
 
         assert (
-            train_idx > 0
-        ), f"Insufficient training convs: The number of conversations {len(conv_dfs)} * {TRAIN_VAL_TEST_PERCS[0]} is below 1, please provide more conversations"
-        assert (
-            val_idx > 0
-        ), f"Insufficient validations convs: The number of conversations {len(conv_dfs)} * {TRAIN_VAL_TEST_PERCS[1]} is below 1, please provide more conversations"
+            len(new_conv_nums) == 0
+        ), f"Remaining converstion number list length must be 0, not {len(new_conv_nums)}"
 
-        return {
-            "train": conv_dfs[:train_idx],
-            "val": conv_dfs[train_idx : train_idx + val_idx],
-            "test": conv_dfs[train_idx + val_idx :],
-        }
+    def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
+        # update the splti dict
+        update_split_dict()
+
+        ret = {"train": [], "val": [], "test": []}
+        # Now use the indicies to split the conversations into train, validation, and test
+        # We assume that each conv_df has one and only one conversation number
+        for conv_df in conv_dfs:
+            for key, conv_nums in split_dict.items():
+                if conv_df.conv_num in conv_nums:
+                    ret[key].append(conv_df)
+
+        return ret
 
     ### Training functions ###
+    def run_payload(
+        model: NextByteLSTM,
+        context: List[int],
+        payload: List[int],
+        force_teacher: bool = True,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+
+        # Add the start of packet indication
+        context.append(SOS)
+        if len(context) > P_CTX_LEN:
+            context.pop(0)
+            # context = context[-1 * P_CTX_LEN :]
+
+        assert (
+            len(context) <= P_CTX_LEN
+        ), f"The context length of {len(context)} must not exceed {P_CTX_LEN}"
+
+        # Create a training batch
+        n_good = 0
+
+        # Make allowence for accumulating context
+        batch_size = max(len(payload) - P_CTX_LEN + len(context), 0)
+        batch_logits = torch.zeros(
+            (batch_size, VOCAB_DIM), dtype=torch.float32, device=DEVICE
+        )
+        batch_preds = torch.zeros((batch_size), dtype=torch.long, device=DEVICE)
+        batch_targets = torch.zeros((batch_size), dtype=torch.long, device=DEVICE)
+
+        i = 0
+        # Ensure we have ample context
+        for byte in payload:
+            if len(context) < P_CTX_LEN:
+                context.append(byte)
+                continue
+
+            # Get the predicted byte
+            logits = model(torch.tensor([context], dtype=torch.long, device=DEVICE))
+
+            pred_byte = int(logits.argmax(-1)[0])
+            if force_teacher:
+                context.append(byte)
+            else:
+                context.append(pred_byte)
+
+            batch_logits[i, :] = logits
+            batch_targets[i] = byte
+            batch_preds[i] = pred_byte
+
+            if byte == pred_byte:
+                n_good += 1
+
+            # Ensure our context length remains the same
+            context.pop(0)
+
+            i += 1
+
+        return batch_size, batch_logits, batch_targets, batch_preds, n_good
+
     def run_conv(
         model: NextByteLSTM,
         conv_df: PacketDataset,
@@ -199,20 +299,25 @@ if __name__ == "__main__":
             - The context is simply stored as a fixed length of bytes
             - The batch size is determined by the sequence length
             - New meta data is encoded for each packet
-
+            - We do byte by byte training rather than teacher forcing. Since the model is auto
+            regressive, any single error will throw the entire prediction off. Therefore the
+            model must be trained in the same manner that it will infer.
         @Returns:
         """
         conv_loss = list()
         conv_acc = list()
-        model.hidden = None
 
-        context = list()
+        # Keep 2 copies of the context and hidden states for the purpose of updating the 
+        # hidden state to the true content once the packet has been predicted
+        pred_context = list()
+        true_context = list()
+
+        pred_hidden = None
+        true_hidden = None
 
         tot_cnt = 0
         tot_good_cnt = 0
-
-        window_cnt = 0
-        good_window_cnt = 0
+        batch_num = 1
 
         # Go through the packets by batch size and perform the training step for each batch
         while True:
@@ -225,82 +330,57 @@ if __name__ == "__main__":
             cat_f = cur_packet.cat_features
             num_f = cur_packet.numerical_features
 
-            # Create a training batch
-            batch = list()
-            targets = list()
-            batch_num = 1
-            batch_loss = 0
-            n_good = 0
-
-            context.append(SOS)
-            if len(context) > P_CTX_LEN:
-                context = context[-1 * P_CTX_LEN :]
-
-            if len(cur_packet.payload) == 0:
-                continue
-
             # Embed the metadata features into the model
-            # Embed zeros to ensure that the metadata_emb property is initialized
+            # Testing without any knowledge of meta data
             # model.embed_meta_data(
             #     torch.zeros(model.cat_emb_dim, dtype=torch.long, device=DEVICE),
             #     torch.zeros(model.numerical_emb_dim, dtype=torch.long, device=DEVICE),
             # )
             model.embed_meta_data(cat_f, num_f)
 
-            # Ensure we have ample context
-            for byte in cur_packet.payload:
-                if len(context) < P_CTX_LEN:
-                    context.append(byte)
-                    continue
+            if len(cur_packet.payload) == 0:
+                continue
 
-                if train:
-                    batch.append(torch.tensor(context, dtype=torch.long))
-                    targets.append(byte)
-                    context.append(byte)
-                else:
-                    # Get the predicted byte
-                    logits = model(
-                        torch.tensor([context], dtype=torch.long, device=DEVICE)
-                    )
-                    loss = criterion(
-                        logits, torch.tensor([byte], dtype=torch.long, device=DEVICE)
-                    )
-                    batch_loss += loss.item()
+            # Run th model to get the predictions and loss with no teacher forcing
+            model.hidden = pred_hidden
+            batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
+                model, pred_context, cur_packet.payload, force_teacher=False
+            )
 
-                    pred_byte = int(logits.argmax(-1)[0])
-                    context.append(pred_byte)
+            # Run the model with trainer forcing to update the true context
+            model.hidden = true_hidden
+            batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
+                model, pred_context, cur_packet.payload, force_teacher=False
+            )
 
-                    if byte == pred_byte:
-                        n_good += 1
 
-                context = context[-1 * P_CTX_LEN :]
+            if batch_size == 0:
+                continue
+
+            loss = criterion(batch_logits, batch_targets)
+            batch_loss = loss.item()
 
             if train:
-                batch = torch.stack(batch, dim=0).to(DEVICE)
-                targets = torch.tensor(targets, dtype=torch.long, device=DEVICE)
-
-                logits = model(batch)
-                pred_bytes = logits.argmax(-1)
-                loss = criterion(logits, targets)
-
-                n_good = int((pred_bytes == targets).sum(dim=-1))
-
-                print(f"Pred bytes: {pred_bytes}\ntarget bytes: {targets}\n")
-
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+            else:
+                # Now update the hidden state with the correct packet data
+                model.hidden = None
 
-                batch_loss = loss.item()
-
-            tot_cnt += len(cur_packet.payload)
+            tot_cnt += batch_size
             tot_good_cnt += n_good
             conv_loss.append(batch_loss)
-            conv_acc.append(n_good / len(cur_packet.payload))
+            conv_acc.append(n_good / batch_size)
             batch_num += 1
 
-            if DEBUG_MODE:
+            # Now that we have completed a batch update the context with the
+            # legitimate bytes
+            upd_len = min(len(cur_packet.payload), P_CTX_LEN)
+            context[-1 * upd_len :] = cur_packet.payload[-1 * upd_len :]
 
+            if DEBUG_MODE:
+                print(f"Pred bytes: {batch_preds}\ntarget bytes: {batch_targets}\n")
                 # Print some helpful info about the training step
                 print_update(
                     batch_num=batch_num,
@@ -310,13 +390,23 @@ if __name__ == "__main__":
                     global_acc=tot_good_cnt / tot_cnt,
                 )
 
+            if (train and batch_num > P_TRAIN_INTERRUPT) or (
+                not train and batch_num > P_VAL_INTERRUPT
+            ):
+                break
+
         if DEBUG_MODE:
+            mode = "Train" if train else "Validation"
+            conv_number = conv_df.conv_num
             plot_metrics(
-                conv_loss, f"Conversation loss", x_label="Batches", y_label="Batch Loss"
+                conv_loss,
+                f"Conv {conv_df.conv_num} loss in ({mode})",
+                x_label="Batches",
+                y_label="Batch Loss",
             )
             plot_metrics(
                 conv_acc,
-                f"Conversation accuracy",
+                f"Conv {conv_df.conv_num} accuracy in ({mode})",
                 x_label="Batches",
                 y_label="Batch accuracy",
             )
@@ -326,33 +416,55 @@ if __name__ == "__main__":
             tot_good_cnt / tot_cnt if tot_cnt > 0 else float("inf"),
         )
 
-    # Get the byte sequence
-    def model_train():
-        # Get the dataset for the conversation data
-        df = load_df()
-
-        # Process the dfs into byte streams
-        splits = split_into_conversations(df)
-        conv_dfs = [PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits]
-
-        if len(conv_dfs) == 0:
-            return
-
-        cat_dims = conv_dfs[0].cat_dims
-        num_dims = conv_dfs[0].num_dims
-
-        # Define the cross entropy loss model and optimizer
-        byte_predictor = NextByteLSTM(
-            cat_dims=cat_dims, num_dims=num_dims, device=DEVICE
-        )
-
-        # Now create the optimizer and criterion
-        optimizer = torch.optim.Adam(
-            byte_predictor.parameters(), lr=P_LEARNING_RATE, weight_decay=P_WEIGHT_DECAY
-        )
-
-        # criterion = nn.CrossEntropyLoss(reduction="mean")
+    def train_epoch(
+        conv_dfs: List[PacketDataset], model: NextByteLSTM, optimizer
+    ) -> EpochResults:
+        results = EpochResults()
         criterion = LabelSmoothingCrossEntropy(smoothing=P_SMOOTHING)
+
+        # Divide each conversation into testing, training, and validation splits
+        train, validation, test = split_convs(conv_dfs).values()
+
+        print(f"split dict: {split_dict}")
+
+        # Set the model in training mode
+        model.train()
+        epoch_loss = 0.0
+        epoch_acc = 0.0
+
+        for conv_df in train:
+            avg_loss, avg_acc = run_conv(
+                model, conv_df, optimizer, criterion, train=True
+            )
+            epoch_loss += avg_loss
+            epoch_acc += avg_acc
+
+        results.avg_train_loss = epoch_loss / len(conv_dfs)
+
+        results.avg_train_acc = epoch_acc / len(conv_dfs)
+
+        # now switch to validation
+        print("Switching to validation")
+        model.eval()
+        val_loss = 0.0
+        val_acc = 0.0
+
+        with torch.no_grad():
+            for conv_df in validation:
+                avg_loss, avg_acc = run_conv(
+                    model, conv_df, optimizer, criterion, train=False
+                )
+                val_loss += avg_loss
+                val_acc += avg_acc
+
+        results.avg_val_loss = val_loss / len(conv_dfs)
+
+        results.avg_val_acc = val_acc / len(conv_dfs)
+
+        return results
+
+    # Get the byte sequence
+    def model_train(csv_dir: str):
 
         # Metrics
         best_val_loss = float("inf")
@@ -361,81 +473,79 @@ if __name__ == "__main__":
         train_accs = list()
         val_accs = list()
 
+        # Declare empty model, optimizer and criterion
+        byte_predictor = None
+        optimizer = None
+
         # Now train over n training epochs
         for epoch in range(N_EPOCHS):
-            # Divide each conversation into testing, training, and validation splits
-            train, validation, test = split_convs(conv_dfs).values()
+            dfs = load_dfs_from_dir(csv_dir=csv_dir)
+            for df in dfs:
+                # Get the conversations splits
+                splits = split_into_conversations(df, conv_list=conv_list)
 
-            # Set the model in training mode
-            byte_predictor.train()
-            epoch_loss = 0.0
-            epoch_acc = 0.0
+                conv_dfs = [
+                    PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
+                ]
 
-            for conv_df in train:
-                avg_loss, avg_acc = run_conv(
-                    byte_predictor, conv_df, optimizer, criterion, train=True
-                )
-                epoch_loss += avg_loss
-                epoch_acc += avg_acc
-
-            avg_train_loss = epoch_loss / len(conv_dfs)
-            train_losses.append(avg_train_loss)
-
-            avg_train_acc = epoch_acc / len(conv_dfs)
-            train_accs.append(avg_train_acc)
-
-            # now switch to validation
-            print("Switching to validation")
-            byte_predictor.eval()
-            val_loss = 0.0
-            val_acc = 0.0
-
-            with torch.no_grad():
-                for conv_df in validation:
-                    avg_loss, avg_acc = run_conv(
-                        byte_predictor, conv_df, optimizer, criterion, train=False
+                # Since we now have the features and dimensions we can initialize the model
+                if byte_predictor is None:
+                    cat_dims = conv_dfs[0].cat_dims
+                    num_dims = conv_dfs[0].num_dims
+                    byte_predictor = NextByteLSTM(
+                        cat_dims=cat_dims, num_dims=num_dims, device=DEVICE
                     )
-                    val_loss += avg_loss
-                    val_acc += avg_acc
+                    optimizer = torch.optim.Adam(
+                        byte_predictor.parameters(),
+                        lr=P_LEARNING_RATE,
+                        weight_decay=P_WEIGHT_DECAY,
+                    )
 
-            avg_val_loss = val_loss / len(conv_dfs)
-            val_losses.append(avg_val_loss)
-
-            avg_val_acc = val_acc / len(conv_dfs)
-            val_accs.append(avg_val_acc)
-
-            print(f"Epoch {epoch+1}/{N_EPOCHS}:")
-            print(f"  Training Loss: {avg_train_loss:.4f}")
-            print(f"  Training Acc: {avg_train_acc:.4f}")
-
-            # Model checkpointing
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": byte_predictor.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "train_loss": avg_train_loss,
-                        "val_loss": avg_val_loss,
-                    },
-                    f"source_code/checkpoints/model_epoch_{epoch}.pt",
+                results = train_epoch(
+                    conv_dfs,
+                    byte_predictor,
+                    optimizer=optimizer,
                 )
 
-            # Print metrics
-            print(f"Epoch {epoch+1}/{N_EPOCHS}:")
-            print(f"  Validation Loss: {avg_val_loss:.4f}")
-            print(f"  Validation Acc: {avg_val_acc:.4f}")
+                print(f"Epoch {epoch+1}/{N_EPOCHS}:")
+                print(f"  Training Loss: {results.avg_train_loss:.4f}")
+                print(f"  Training Acc: {results.avg_train_acc:.4f}")
 
-            # Early stopping check
-            if len(val_losses) > PATIENCE:
-                if all(val_losses[-PATIENCE:] > best_val_loss):
-                    print("Early stopping triggered")
-                    break
+                train_losses.append(results.avg_train_loss)
+                train_accs.append(results.avg_train_acc)
+                val_losses.append(results.avg_val_loss)
+                val_accs.append(results.avg_val_acc)
 
-            # Process the dfs into byte streams
-            conv_dfs = [
-                PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits
-            ]
+                # Model checkpointing
+                if results.avg_val_loss < best_val_loss:
+                    best_val_loss = results.avg_val_loss
+                    torch.save(
+                        {
+                            "epoch": epoch,
+                            "model_state_dict": byte_predictor.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "train_loss": results.avg_train_loss,
+                            "val_loss": results.avg_val_loss,
+                        },
+                        f"source_code/checkpoints/model_epoch_{epoch}.pt",
+                    )
 
-    model_train()
+                # Print metrics
+                print(f"Epoch {epoch+1}/{N_EPOCHS}:")
+                print(f"  Validation Loss: {results.avg_val_loss:.4f}")
+                print(f"  Validation Acc: {results.avg_val_acc:.4f}")
+
+                # Early stopping check
+                if len(val_losses) > PATIENCE:
+                    if all([v > best_val_loss for v in val_losses[-PATIENCE:]]):
+                        print("Early stopping triggered")
+                        break
+
+                # Process the dfs into packet datasets
+                conv_dfs = [
+                    PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits
+                ]
+
+    ### Training entry point ###
+    csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
+    model_train(csv_dir=csv_dir)

@@ -91,6 +91,8 @@ class PacketDataset(Dataset):
         self.cnt = 0
         self.len = len(df)
         self.history = list()
+        number_list = self.features["conv.number"]["values"]
+        self.conv_num = int(number_list[0])
 
         self._process_packets()
 
@@ -357,7 +359,8 @@ if __name__ == "__main__":
     # Get the packet data set
     df = load_df()
 
-    conv_dfs = split_into_conversations(df)
+    conv_list = list()
+    conv_dfs = split_into_conversations(df, conv_list=conv_list)
 
     def test_packet_dataset(df: pd.DataFrame):
         ds = PacketDataset(df, 1)

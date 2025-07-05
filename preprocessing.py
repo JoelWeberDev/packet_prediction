@@ -36,7 +36,7 @@ import re
 import matplotlib.pyplot as plt
 from icecream import ic
 from dataclasses import dataclass
-from typing import Type, Union, Dict, List
+from typing import Type, Union, Dict, List, Tuple, Iterator
 
 # Local imports
 from CONSTANTS import *
@@ -229,7 +229,7 @@ def extract_features(
         },  # flow direction classification based ips
         "conv.number": {
             "dtype": "categorical",
-            "values": np.array(df["conv.number"], dtype=np.uint16),  # categorical
+            "values": np.array(df["conv.number"], dtype=np.uint32),  # categorical
             "dims": max(2, n_convs),  # gets incremented as we add conversations
         },  # unique number assiged to each conversation
         "mqtt.msg": {
@@ -310,8 +310,11 @@ def payload_deltas(trans_df: pd.DataFrame) -> Dict[str, np.ndarray]:
     return deltas
 
 
-def load_df(print_info: bool = False) -> pd.DataFrame:
-    csv_path = "source_code/test_data/legtimate_w1-0.csv"
+def load_df(
+    csv_path: str = "source_code/test_data/legtimate_w1-0.csv", print_info: bool = False
+) -> pd.DataFrame:
+    assert os.path.exists(csv_path), f"Provided csv path {csv_path} does not exist"
+    assert csv_path.endswith(".csv"), f"Path must end with .csv"
 
     df = pd.read_csv(
         csv_path,
@@ -330,8 +333,21 @@ def load_df(print_info: bool = False) -> pd.DataFrame:
 
 
 def split_into_conversations(
-    df: pd.DataFrame, add_conv_num: bool = True
+    df: pd.DataFrame,
+    conv_list: List[Tuple[str, str]],
+    add_conv_num: bool = True,
 ) -> List[pd.DataFrame]:
+    """
+    @Description: Takes a data frame from the mqtt data and divides it into separate
+    conversations each indexed by a uniqe conversation number. The conv_list is
+    provided to ensure that conversation number uniqueness remains consistent throughout
+    multiplie conversation splits. If starting fresh just pass an empty list.
+
+    @Notes:
+        - The conv_list is modified if there a new conversation is found. Appending to a list
+        passed to a function modifies that list and not just a copy of it.
+
+    """
     ips = list(col_values_set(df, SRC_IP_TAG).keys())
 
     convs = list()
@@ -342,11 +358,35 @@ def split_into_conversations(
         for ip2 in ips:
             conv_df = conversation_filter(df, ip1, ip2).copy()
             if len(conv_df) > 0:
+                # Search for the conversation in the conv list
+                conv_num = len(conv_list)
+                for i, (c_ip1, c_ip2) in enumerate(conv_list):
+                    if ((c_ip1 == ip1) and (c_ip2 == ip2)) or (
+                        (c_ip1 == ip2) and (c_ip2 == ip1)
+                    ):
+                        conv_num = i
+                        break
+
+                if conv_num == len(conv_list):
+                    conv_list.append((ip1, ip2))
+
                 if add_conv_num:
-                    conv_df["conv.number"] = [len(convs) + 1] * len(conv_df)
+                    conv_df["conv.number"] = [conv_num] * len(conv_df)
+
                 convs.append(conv_df)
 
     return convs
+
+
+def load_dfs_from_dir(csv_dir: str) -> Iterator[pd.DataFrame]:
+
+    assert os.path.isdir(
+        csv_dir
+    ), f"The provided csv directory, {csv_dir} is not a directory"
+
+    for fname in os.listdir(csv_dir):
+        if fname.endswith(".csv"):
+            yield load_df(os.path.join(csv_dir, fname))
 
 
 if __name__ == "__main__":
@@ -361,6 +401,8 @@ if __name__ == "__main__":
     #         print(
     #             f"{key}: {value.shape}, first: {value[0]} max: {value.max()}, min: {value.min()}"
     #         )
+
+    print(df["frame.number"][0])
 
     ### testing functions ###
     def ips_count(df):

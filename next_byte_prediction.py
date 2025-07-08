@@ -350,7 +350,7 @@ if __name__ == "__main__":
             # Run the model with trainer forcing to update the true context
             model.hidden = true_hidden
             batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
-                model, pred_context, cur_packet.payload, force_teacher=False
+                model, true_context, cur_packet.payload, force_teacher=False
             )
 
 

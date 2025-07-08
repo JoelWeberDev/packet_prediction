@@ -41,7 +41,11 @@ from helper_functions import (
     get_memory,
     print_update,
     plot_metrics,
+    sample_with_temperature,
 )
+
+### Globals ###
+g_cur_temperature = P_INITIAL_TEMPERATURE
 
 
 ### Custom loss functions ###
@@ -265,7 +269,7 @@ if __name__ == "__main__":
 
             logits = model(ctx_tensor)
 
-            pred_byte = int(logits.argmax(-1)[0])
+            pred_byte = sample_with_temperature(logits, g_cur_temperature)
             if force_teacher:
                 context.append(byte)
             else:
@@ -314,11 +318,12 @@ if __name__ == "__main__":
         pred_context = list()
         true_context = list()
 
-        true_hidden = None
+        model.hidden = None
 
         tot_cnt = 0
         tot_good_cnt = 0
         batch_num = 1
+        mode = "Train" if train else "Validation"
 
         # Go through the packets by batch size and perform the training step for each batch
         while True:
@@ -338,7 +343,7 @@ if __name__ == "__main__":
                 continue
 
             # Run th model to get the predictions and loss with no teacher forcing
-            model.hidden = deepcopy(true_hidden)
+            true_hidden = deepcopy(model.hidden)
             batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
                 model,
                 pred_context,
@@ -384,6 +389,7 @@ if __name__ == "__main__":
                 print(f"Pred bytes: {batch_preds}\ntarget bytes: {batch_targets}\n")
                 # Print some helpful info about the training step
                 print_update(
+                    mode=mode,
                     batch_num=batch_num,
                     batch_size=len(cur_packet.payload),
                     loss=batch_loss,
@@ -397,7 +403,6 @@ if __name__ == "__main__":
                 break
 
         if show_plots:
-            mode = "Train" if train else "Validation"
             plot_metrics(
                 conv_loss,
                 f"Conv {conv_df.conv_num} loss in ({mode})",
@@ -473,6 +478,7 @@ if __name__ == "__main__":
 
     # Get the byte sequence
     def model_train(csv_dir: str):
+        global g_cur_temperature
 
         # Metrics
         best_val_loss = float("inf")
@@ -484,9 +490,11 @@ if __name__ == "__main__":
         # Declare empty model, optimizer and criterion
         byte_predictor = None
         optimizer = None
+        scheduler = None
 
         # Now train over n training epochs
         for epoch in range(N_EPOCHS):
+            g_cur_temperature = P_INITIAL_TEMPERATURE * (1 - epoch / N_EPOCHS)
             dfs = load_dfs_from_dir(csv_dir=csv_dir)
             for df in dfs:
                 # Get the conversations splits
@@ -508,6 +516,9 @@ if __name__ == "__main__":
                         lr=P_LEARNING_RATE,
                         weight_decay=P_WEIGHT_DECAY,
                     )
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer=optimizer, mode="min", factor=0.1, patience=10
+                    )
 
                 results = train_epoch(
                     conv_dfs, byte_predictor, optimizer=optimizer, show_plots=False
@@ -521,6 +532,9 @@ if __name__ == "__main__":
                 train_accs.append(results.avg_train_acc)
                 val_losses.append(results.avg_val_loss)
                 val_accs.append(results.avg_val_acc)
+
+                # Update the training parameters
+                scheduler.step(results.avg_val_loss)
 
                 # Model checkpointing
                 if results.avg_val_loss < best_val_loss:
@@ -552,35 +566,36 @@ if __name__ == "__main__":
                     PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits
                 ]
 
-        # Plot the metrics over the training process
-        plot_metrics(
-            train_losses,
-            title=f"Overall training loss",
-            x_label="epoch",
-            y_label="Loss",
-        )
-        plot_metrics(
-            train_accs,
-            title=f"Overall training accuracy",
-            x_label="epoch",
-            y_label="Accuracy",
-        )
-        plot_metrics(
-            val_losses,
-            title=f"Overall validation loss",
-            x_label="epoch",
-            y_label="Loss",
-        )
-        plot_metrics(
-            val_accs,
-            title=f"Overall validation accuracy",
-            x_label="epoch",
-            y_label="Accuracy",
-        )
+            # Plot the metrics over the training process
+            plot_metrics(
+                train_losses,
+                title=f"Overall training loss",
+                x_label="epoch",
+                y_label="Loss",
+            )
+            plot_metrics(
+                train_accs,
+                title=f"Overall training accuracy",
+                x_label="epoch",
+                y_label="Accuracy",
+            )
+            plot_metrics(
+                val_losses,
+                title=f"Overall validation loss",
+                x_label="epoch",
+                y_label="Loss",
+            )
+            plot_metrics(
+                val_accs,
+                title=f"Overall validation accuracy",
+                x_label="epoch",
+                y_label="Accuracy",
+            )
 
     ### Training entry point ###
     # csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
-    csv_dir = (
-        "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
-    )
+    csv_dir = "source_code/test_data"
+    # csv_dir = (
+    #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    # )
     model_train(csv_dir=csv_dir)

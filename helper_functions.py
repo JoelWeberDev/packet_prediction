@@ -15,6 +15,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Dict, Tuple, Iterator
 from dataclasses import dataclass
 
@@ -69,8 +70,8 @@ def get_memory(device: str = DEVICE) -> Dict[str, float]:
         }
 
 
-def print_update(batch_num: int, **kwargs):
-    print(f"\n Train step: {batch_num}")
+def print_update(**kwargs):
+    print(f"\n")
     for key, val in kwargs.items():
         print(f"    {key}: {val}")
 
@@ -103,9 +104,9 @@ def plot_metrics(
     plt.show()
 
 
-def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0):
+def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0) -> int:
     if temp == 0:
-        return torch.argmax(logits, dim=-1)
+        return int(torch.argmax(logits, dim=-1))
 
     probs = F.softmax(logits / temp, dim=-1)
-    return torch.multinomial(probs, 1).squeeze(-1)
+    return int(torch.multinomial(probs, 1).squeeze(-1))

@@ -29,6 +29,7 @@ import torch
 import torch.nn as nn
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
+from copy import deepcopy
 
 ### Local imports ###
 from preprocessing import load_df, split_into_conversations, load_dfs_from_dir
@@ -162,17 +163,6 @@ class NextByteLSTM(nn.Module):
 
         output, (hx, cx) = self.next_byte_predictor(input_emb, self.hidden)
 
-        # Compute the net difference between the internal states
-        if False and self.hidden is not None:
-            h_diffs = torch.abs((hx - self.hidden[0]))
-            print(
-                f"\nh_diff mean: {torch.mean(h_diffs)}, h_diff_median: {torch.median(h_diffs)}"
-            )
-            c_diffs = torch.abs((cx - self.hidden[1]))
-            print(
-                f"c_diff mean: {torch.mean(c_diffs)}, c_diff_median: {torch.median(c_diffs)}\n"
-            )
-
         self.hidden = (hx.detach(), cx.detach())
 
         logits = self.project_outputs(output)
@@ -231,6 +221,7 @@ if __name__ == "__main__":
         context: List[int],
         payload: List[int],
         force_teacher: bool = True,
+        random_mask_ctx: bool = False,
     ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, int]:
 
         # Add the start of packet indication
@@ -262,7 +253,17 @@ if __name__ == "__main__":
                 continue
 
             # Get the predicted byte
-            logits = model(torch.tensor([context], dtype=torch.long, device=DEVICE))
+            ctx_tensor = torch.tensor([context], dtype=torch.long)
+
+            if random_mask_ctx:
+                mask_inds = np.random.choice(
+                    range(len(context)), round(P_CTX_MASK_PERC * len(context))
+                )
+                ctx_tensor[0, mask_inds] = MASK
+
+            ctx_tensor.to(model.device)
+
+            logits = model(ctx_tensor)
 
             pred_byte = int(logits.argmax(-1)[0])
             if force_teacher:
@@ -290,6 +291,7 @@ if __name__ == "__main__":
         optimizer,
         criterion,
         train: bool = True,
+        show_plots: bool = DEBUG_MODE,
     ) -> Tuple[float, float]:
         """
         @Description: This takes the next packet from the data set and uses that to train or
@@ -307,12 +309,11 @@ if __name__ == "__main__":
         conv_loss = list()
         conv_acc = list()
 
-        # Keep 2 copies of the context and hidden states for the purpose of updating the 
+        # Keep 2 copies of the context and hidden states for the purpose of updating the
         # hidden state to the true content once the packet has been predicted
         pred_context = list()
         true_context = list()
 
-        pred_hidden = None
         true_hidden = None
 
         tot_cnt = 0
@@ -331,32 +332,35 @@ if __name__ == "__main__":
             num_f = cur_packet.numerical_features
 
             # Embed the metadata features into the model
-            # Testing without any knowledge of meta data
-            # model.embed_meta_data(
-            #     torch.zeros(model.cat_emb_dim, dtype=torch.long, device=DEVICE),
-            #     torch.zeros(model.numerical_emb_dim, dtype=torch.long, device=DEVICE),
-            # )
             model.embed_meta_data(cat_f, num_f)
 
             if len(cur_packet.payload) == 0:
                 continue
 
             # Run th model to get the predictions and loss with no teacher forcing
-            model.hidden = pred_hidden
+            model.hidden = deepcopy(true_hidden)
             batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
-                model, pred_context, cur_packet.payload, force_teacher=False
+                model,
+                pred_context,
+                cur_packet.payload,
+                force_teacher=False,
+                random_mask_ctx=True,
             )
 
             # Run the model with trainer forcing to update the true context
             model.hidden = true_hidden
-            batch_size, batch_logits, batch_targets, batch_preds, n_good = run_payload(
-                model, true_context, cur_packet.payload, force_teacher=False
+            _, true_logits, true_targets, true_preds, n_true_good = run_payload(
+                model,
+                true_context,
+                cur_packet.payload,
+                force_teacher=True,
+                random_mask_ctx=False,
             )
-
 
             if batch_size == 0:
                 continue
 
+            # Use the loss from the auto regressive generation since it best matches the validation process
             loss = criterion(batch_logits, batch_targets)
             batch_loss = loss.item()
 
@@ -364,9 +368,6 @@ if __name__ == "__main__":
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-            else:
-                # Now update the hidden state with the correct packet data
-                model.hidden = None
 
             tot_cnt += batch_size
             tot_good_cnt += n_good
@@ -376,8 +377,8 @@ if __name__ == "__main__":
 
             # Now that we have completed a batch update the context with the
             # legitimate bytes
-            upd_len = min(len(cur_packet.payload), P_CTX_LEN)
-            context[-1 * upd_len :] = cur_packet.payload[-1 * upd_len :]
+            # upd_len = min(len(cur_packet.payload), P_CTX_LEN)
+            # context[-1 * upd_len :] = cur_packet.payload[-1 * upd_len :]
 
             if DEBUG_MODE:
                 print(f"Pred bytes: {batch_preds}\ntarget bytes: {batch_targets}\n")
@@ -395,9 +396,8 @@ if __name__ == "__main__":
             ):
                 break
 
-        if DEBUG_MODE:
+        if show_plots:
             mode = "Train" if train else "Validation"
-            conv_number = conv_df.conv_num
             plot_metrics(
                 conv_loss,
                 f"Conv {conv_df.conv_num} loss in ({mode})",
@@ -417,7 +417,10 @@ if __name__ == "__main__":
         )
 
     def train_epoch(
-        conv_dfs: List[PacketDataset], model: NextByteLSTM, optimizer
+        conv_dfs: List[PacketDataset],
+        model: NextByteLSTM,
+        optimizer,
+        show_plots: bool = DEBUG_MODE,
     ) -> EpochResults:
         results = EpochResults()
         criterion = LabelSmoothingCrossEntropy(smoothing=P_SMOOTHING)
@@ -434,7 +437,7 @@ if __name__ == "__main__":
 
         for conv_df in train:
             avg_loss, avg_acc = run_conv(
-                model, conv_df, optimizer, criterion, train=True
+                model, conv_df, optimizer, criterion, train=True, show_plots=show_plots
             )
             epoch_loss += avg_loss
             epoch_acc += avg_acc
@@ -452,7 +455,12 @@ if __name__ == "__main__":
         with torch.no_grad():
             for conv_df in validation:
                 avg_loss, avg_acc = run_conv(
-                    model, conv_df, optimizer, criterion, train=False
+                    model,
+                    conv_df,
+                    optimizer,
+                    criterion,
+                    train=False,
+                    show_plots=show_plots,
                 )
                 val_loss += avg_loss
                 val_acc += avg_acc
@@ -502,9 +510,7 @@ if __name__ == "__main__":
                     )
 
                 results = train_epoch(
-                    conv_dfs,
-                    byte_predictor,
-                    optimizer=optimizer,
+                    conv_dfs, byte_predictor, optimizer=optimizer, show_plots=False
                 )
 
                 print(f"Epoch {epoch+1}/{N_EPOCHS}:")
@@ -546,6 +552,35 @@ if __name__ == "__main__":
                     PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits
                 ]
 
+        # Plot the metrics over the training process
+        plot_metrics(
+            train_losses,
+            title=f"Overall training loss",
+            x_label="epoch",
+            y_label="Loss",
+        )
+        plot_metrics(
+            train_accs,
+            title=f"Overall training accuracy",
+            x_label="epoch",
+            y_label="Accuracy",
+        )
+        plot_metrics(
+            val_losses,
+            title=f"Overall validation loss",
+            x_label="epoch",
+            y_label="Loss",
+        )
+        plot_metrics(
+            val_accs,
+            title=f"Overall validation accuracy",
+            x_label="epoch",
+            y_label="Accuracy",
+        )
+
     ### Training entry point ###
-    csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
+    # csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
+    csv_dir = (
+        "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    )
     model_train(csv_dir=csv_dir)

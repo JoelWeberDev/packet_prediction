@@ -102,3 +102,10 @@ def plot_metrics(
     plt.title(title)
     plt.show()
 
+
+def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0):
+    if temp == 0:
+        return torch.argmax(logits, dim=-1)
+
+    probs = F.softmax(logits / temp, dim=-1)
+    return torch.multinomial(probs, 1).squeeze(-1)

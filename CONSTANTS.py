@@ -71,8 +71,9 @@ MQTT_COMMANDS = [
 ### LSTM model meta parameters ###
 # Defines the different possibilites that we could predict
 SOS = 0x100  # start of sentence token
-# NULL = 0x101  # padding token
-N_SPECIAL_TOKNES = 1
+MASK = 0x101 # for markng bytes for the model to ignore
+# NULL = 0x102  # padding token
+N_SPECIAL_TOKNES = 2
 # OUTPUT_VOCAB_DIM = 256
 VOCAB_DIM = 256 + N_SPECIAL_TOKNES
 # BYTE_VOCAB_DIM = 256 + N_SPECIAL_TOKNES  # number of bytes plus special tokens
@@ -127,7 +128,6 @@ CAT_EMB_SCALAR = 1.6
 CAT_EMB_EXPO = 0.56
 MAX_CAT_EMB = 50
 
-
 ### Primitive next byte predictor ###
 P_CTX_LEN = 32
 P_HIDDEN_SIZE = 128
@@ -138,6 +138,7 @@ P_WEIGHT_DECAY = 1e-5
 P_SMOOTHING = 0.2
 P_TRAIN_INTERRUPT = 300
 P_VAL_INTERRUPT = 500
+P_CTX_MASK_PERC = 0.1
 
 
 P_METADATA_DROPOUT = 0.5

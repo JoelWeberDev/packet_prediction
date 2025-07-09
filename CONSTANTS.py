@@ -71,7 +71,7 @@ MQTT_COMMANDS = [
 ### LSTM model meta parameters ###
 # Defines the different possibilites that we could predict
 SOS = 0x100  # start of sentence token
-MASK = 0x101 # for markng bytes for the model to ignore
+MASK = 0x101  # for markng bytes for the model to ignore
 # NULL = 0x102  # padding token
 N_SPECIAL_TOKNES = 2
 # OUTPUT_VOCAB_DIM = 256
@@ -83,22 +83,12 @@ MAX_SEQ_LEN = (
     128  # Hard cap on the payload size anything beyond this will get cut short
 )
 CONV_CONTEXT_LEN = 10  # Number of packets in context
-BYTE_CONTEXT_LEN = 10  # Number of current packet bytes to include in the context
 BYTE_EMBED_DIM = 128  # Could be reduced since this is a major source of parameter count
-PACKET_REP_DIM = 256
-CONVERSATIONAL_HIDDEN_DIM = 512
 
-
-PACKET_ENC_LAYERS = 2
-CONVERSATIONAL_LAYERS = 3
-NEXT_PACKET_LAYERS = 2
 
 PACKET_ENC_DROPOUT = 0.2
 METADATA_MLP_DROPOUT = 0.2
-PACKET_COMBINER_DROPOUT = 0.2
 
-CONV_LSTM_DROPOUT = 0.3
-NEXT_PACKET_DROPOUT = 0.2
 
 ### Training parameters ###
 TRAIN_VAL_TEST_PERCS = np.array([0.70, 0.3, 0])
@@ -114,6 +104,32 @@ ic(f"Using device type: {DEVICE}")
 PATIENCE = 5  # minimum early stopping epochs
 CHECKPOINT_DIR = "checkpoints"
 DEBUG_MODE = True
+
+### Heiarchical Model settings ###
+
+# Conversational lstm params #
+H_CONVERSATIONAL_HIDDEN_DIM = 512
+H_CONVERSATIONAL_LAYERS = 3
+H_CONVERSATIONAL_LSTM_DROPOUT = 0.3
+
+# Packet encoder params #
+H_PACKET_CTX = 4
+H_PAYLOAD_LEN = 32
+H_METADATA_HIDDEN_DIM = 64
+H_METADATA_DROPOUT = 0.3
+H_METADATA_OUTPUT_DIM = 32
+
+H_PACKET_REP_DIM = 256
+H_PACKET_ENC_LAYERS = 2
+H_PACKET_ENC_DROPOUT = 0.3
+H_PACKET_METADATA_SCALE = 0.5
+H_PACKET_COMBINER_DROPOUT = 0.2
+
+# Next packet prediction params #
+H_BYTE_CONTEXT_LEN = 32  # Number of current packet bytes to include in the context
+H_PACKET_ENC_LAYERS = 2
+H_NEXT_PACKET_LAYERS = 2
+H_NEXT_PACKET_DROPOUT = 0.2
 
 
 ### Simple lstm model params ###

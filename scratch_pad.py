@@ -10,11 +10,7 @@ from CONSTANTS import *
 from copy import deepcopy
 
 
-ts = (torch.ones((10, 20)), torch.zeros((20, 10)))
+t1 = torch.ones((10, 20))
+t2 = torch.zeros((20, 10))
 
-
-dc = deepcopy(ts)
-
-print(dc)
-
-print(np.random.choice(range(10), 3))
+print(torch.cat([t1.flatten(), t2.flatten()], dim=-1))

@@ -42,6 +42,7 @@ from helper_functions import (
     print_update,
     plot_metrics,
     sample_with_temperature,
+    google_get_embedding_dim,
 )
 
 ### Globals ###
@@ -68,21 +69,18 @@ class NextByteLSTM(nn.Module):
 
         self.byte_embedding = nn.Embedding(VOCAB_DIM, BYTE_EMBED_DIM)
 
-        # Create meta data embeddings
-        def get_embedding_dim(n_cats: int) -> int:
-            # Google's categorical embedding formuala
-            return min(MAX_CAT_EMB, round((n_cats * CAT_EMB_SCALAR) ** CAT_EMB_EXPO))
-
         # Categorical embeddings
         self.cat_embedder = nn.ModuleList(
             [
-                nn.Embedding(cat_size, get_embedding_dim(cat_size))
+                nn.Embedding(cat_size, google_get_embedding_dim(cat_size))
                 for cat_size in cat_dims
             ]
         )
 
         self.numerical_emb_dim = num_dims
-        self.cat_emb_dim = sum(get_embedding_dim(cat_size) for cat_size in cat_dims)
+        self.cat_emb_dim = sum(
+            google_get_embedding_dim(cat_size) for cat_size in cat_dims
+        )
 
         self.metadata_dim = self.cat_emb_dim + self.numerical_emb_dim
 
@@ -594,7 +592,7 @@ if __name__ == "__main__":
 
     ### Training entry point ###
     # csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
-    csv_dir = "source_code/test_data"
+    csv_dir = "test_data"
     # csv_dir = (
     #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
     # )

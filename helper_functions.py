@@ -110,3 +110,8 @@ def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0) -> int:
 
     probs = F.softmax(logits / temp, dim=-1)
     return int(torch.multinomial(probs, 1).squeeze(-1))
+
+
+def google_get_embedding_dim(n_cats: int) -> int:
+    # Google's categorical embedding formuala
+    return min(MAX_CAT_EMB, round((n_cats * CAT_EMB_SCALAR) ** CAT_EMB_EXPO))

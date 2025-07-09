@@ -4,16 +4,12 @@
 @Description:
 
 @Notes:
-    Workflow design:
-        - For a training step we need a context and target packet
-        - Is passed to the hiearchical model where it creates context embeddings with the
-        target meta data and historical packets.
-            - These historical packets are embedded using a packet embedded that takes the
-            full payload along with the features for each packet.
-        - This context along with the target payload is sent to the next packet predictor which
-            - The next packet metadata is concatenated to the context embeddings
-            - Repeats the context for each unmasked byte in the target payload
-            - Creates a logits byte prediciton for each of the unmasked bytes in the sequence.
+    Workflow:
+        Conversational LSTM
+            - Ingests the conversation packet by packet.
+            - Stores a conversation hidden state
+            - Will call the next byte lstm to generate the next packet
+            - Only accepts one packet at a time
 
 @Questions:
     - What does the packing actually do?
@@ -23,7 +19,7 @@
     - How to create an enum in python
     - If I am running the model on an embedded system, what is a reasonable parameter count?
     - Is it worth zeroing out the embeddings for null characters?
-    - Is projecting to eliminate special characters a valid way to include the without letting 
+    - Is projecting to eliminate special characters a valid way to include the without letting
     the model actually predict them?
 
 
@@ -42,39 +38,36 @@ from dataclasses import dataclass
 from CONSTANTS import *
 from preprocessing import load_df, split_into_conversations
 from custom_datasets import PacketDataset, ParsedPacket, PacketWithContext
+from helper_functions import google_get_embedding_dim
 
 
 class PacketEncoder(nn.Module):
     """Encodes individual packet (metadata + payload) into fixed representation"""
 
-    def __init__(
-        self,
-        categorical_dims=list(),
-        numerical_dim=0,
-    ):
+    def __init__(self, cat_dims: List[int], num_dims: int, device=DEVICE):
         super().__init__()
 
         # Byte embedding
-        self.byte_embedding = nn.Embedding(BYTE_VOCAB_DIM, BYTE_EMBED_DIM)
+        self.byte_embedder = nn.Embedding(VOCAB_DIM, BYTE_EMBED_DIM)
 
         # Categorical embeddings
-        self.cat_embeddings = nn.ModuleList(
+        self.cat_embedder = nn.ModuleList(
             [
-                nn.Embedding(cat_size, max(50, cat_size // 2))
-                for cat_size in categorical_dims
+                nn.Embedding(cat_size, google_get_embedding_dim(cat_size))
+                for cat_size in cat_dims
             ]
         )
 
         # Calculate input dimension for packet LSTM
-        cat_embed_dim = sum(max(50, cat_size // 2) for cat_size in categorical_dims)
+        cat_embed_dim = sum(google_get_embedding_dim(cat_size) for cat_size in cat_dims)
+
         # packet_lstm_input_dim = byte_embed_dim + cat_embed_dim + numerical_dim
-        # TODO: this may need to be changed. We are only embedding 1 byte not the entire sequence
         packet_lstm_input_dim = BYTE_EMBED_DIM
 
         # Packet-level LSTM (processes bytes within packet)
         self.packet_lstm = nn.LSTM(
             input_size=packet_lstm_input_dim,
-            hidden_size=PACKET_REP_DIM // 2,  # Will be bidirectional
+            hidden_size=H_PACKET_REP_DIM // 2,  # Will be bidirectional
             num_layers=PACKET_ENC_LAYERS,
             batch_first=True,
             bidirectional=True,
@@ -83,23 +76,23 @@ class PacketEncoder(nn.Module):
 
         # Additional MLP to process metadata separately
         self.metadata_mlp = nn.Sequential(
-            nn.Linear(cat_embed_dim + numerical_dim, PACKET_REP_DIM // 4),
+            nn.Linear(cat_embed_dim + num_dims, H_PACKET_REP_DIM // 4),
             nn.ReLU(),
             nn.Dropout(METADATA_MLP_DROPOUT),
         )
 
         # Combine packet content + metadata
         self.packet_combiner = nn.Sequential(
-            nn.Linear(PACKET_REP_DIM + PACKET_REP_DIM // 4, PACKET_REP_DIM),
+            nn.Linear(H_PACKET_REP_DIM + H_PACKET_REP_DIM // 4, H_PACKET_REP_DIM),
             nn.ReLU(),
-            nn.Dropout(PACKET_COMBINER_DROPOUT),
+            nn.Dropout(H_PACKET_COMBINER_DROPOUT),
         )
 
     def forward(
         self,
-        byte_sequence : torch.Tensor,
-        categorical_features : torch.Tensor,
-        numerical_features : torch.Tensor,
+        payloads: torch.Tensor,
+        cat_features: torch.Tensor,
+        num_features: torch.Tensor,
     ):
         """
         @Description: Forward pass for the single packet embedding and prediciton LSTM model.
@@ -108,28 +101,27 @@ class PacketEncoder(nn.Module):
         each byte sequence. The attention mask must have the same shape as the byte sequence.
 
         @Notes:
-            - The numerical and categorical features remain constant throughout the packet
-            - The batch size may vary depending on the length of the sequence. Typically
-            we cap the batch size at min(32, sequnce length)
+            - This expects a payload with a context length of H_PAYLOAD_LEN
+
 
         @Returns:
         """
-        batch_size, seq_len = byte_sequence.shape
+        batch_size, ctx_len = payloads.shape
 
-        # Embed categorical features and repeat for sequence
-        cat_embeds = []
-        for i, embedding_layer in enumerate(self.cat_embeddings):
-            cat_embed = embedding_layer(categorical_features[:, i])
-            cat_embeds.append(cat_embed)
-        cat_embeds = (
-            torch.cat(cat_embeds, dim=-1) if cat_embeds else torch.empty(batch_size, 0)
+        # Embed the categorical features using the cat embeddings from above
+        cat_emb = torch.cat(
+            [
+                cat_embedder(cat_f)
+                for cat_f, cat_embedder in zip(cat_features, self.cat_embedder)
+            ],
+            dim=-1,
         )
 
         # Embed bytes
-        byte_embeds = self.byte_embedding(byte_sequence)  # [batch, seq_len, embed_dim]
+        byte_embeds = self.byte_embedder(payloads)  # [batch, seq_len, embed_dim]
 
         # Now pack the embeddings using the attention mask
-        lengths =  (byte_sequence == NULL).sum(dim=1).cpu() # [batch_size]
+        lengths = (payloads == MASK).sum(dim=1).cpu()  # [batch_size]
         packed_embeds = nn.utils.rnn.pack_padded_sequence(
             byte_embeds, lengths, batch_first=True, enforce_sorted=False
         )
@@ -141,13 +133,21 @@ class PacketEncoder(nn.Module):
         # Take final hidden state as packet representation
         packet_content_repr = lstm_output[:, -1, :]  # [batch, packet_repr_dim]
 
+        assert packet_content_repr.shape == (
+            batch_size,
+            H_PACKET_REP_DIM,
+        ), f"The packet shape of {packet_content_repr.shape} must equal {(batch_size, H_PACKET_REP_DIM)}"
+
         # Process metadata separately
-        metadata_input = torch.cat([cat_embeds, numerical_features], dim=-1)
+        metadata_input = torch.cat([cat_emb, num_features], dim=-1)
         metadata_repr = self.metadata_mlp(metadata_input)
 
         # Combine representations
         packet_repr = self.packet_combiner(
-            torch.cat([packet_content_repr, metadata_repr], dim=-1)
+            torch.cat(
+                [packet_content_repr, metadata_repr],
+                dim=-1,
+            )
         )
 
         return packet_repr
@@ -160,11 +160,11 @@ class ConversationLSTM(nn.Module):
         super().__init__()
 
         self.conversation_lstm = nn.LSTM(
-            input_size=PACKET_REP_DIM,
-            hidden_size=CONVERSATIONAL_HIDDEN_DIM,
-            num_layers=CONVERSATIONAL_LAYERS,
+            input_size=H_PACKET_REP_DIM,
+            hidden_size=H_CONVERSATIONAL_HIDDEN_DIM,
+            num_layers=H_CONVERSATIONAL_LAYERS,
             batch_first=True,
-            dropout=CONV_LSTM_DROPOUT,
+            dropout=H_CONVERSATIONAL_LSTM_DROPOUT,
         )
 
     def forward(self, packet_representations, hidden_state=None):
@@ -184,10 +184,16 @@ class ConversationLSTM(nn.Module):
     def init_hidden(self, batch_size, device):
         """Initialize conversation hidden state"""
         h = torch.zeros(
-            CONVERSATIONAL_LAYERS, batch_size, CONVERSATIONAL_HIDDEN_DIM, device=device
+            H_CONVERSATIONAL_LAYERS,
+            batch_size,
+            H_CONVERSATIONAL_HIDDEN_DIM,
+            device=device,
         )
         c = torch.zeros(
-            CONVERSATIONAL_LAYERS, batch_size, CONVERSATIONAL_HIDDEN_DIM, device=device
+            H_CONVERSATIONAL_LAYERS,
+            batch_size,
+            H_CONVERSATIONAL_HIDDEN_DIM,
+            device=device,
         )
         return (h, c)
 
@@ -217,42 +223,55 @@ class NextPacketPredictor(nn.Module):
     @Returns:
     """
 
-    def __init__(self, categorical_dims=list(), numerical_dim=0):
+    def __init__(self, cat_dims: List[int], numerical_dim=0):
         super().__init__()
 
-        # Encode next packet metadata
-        cat_embed_dim = sum(max(50, cat_size // 2) for cat_size in categorical_dims)
-        self.cat_embeddings = nn.ModuleList(
+        # Categorical embeddings
+        self.cat_embedder = nn.ModuleList(
             [
-                nn.Embedding(cat_size, max(50, cat_size // 2))
-                for cat_size in categorical_dims
+                nn.Embedding(cat_size, google_get_embedding_dim(cat_size))
+                for cat_size in cat_dims
             ]
         )
 
+        # Calculate input dimension for packet LSTM
+        cat_embed_dim = sum(google_get_embedding_dim(cat_size) for cat_size in cat_dims)
+
         # Combine conversation context with next packet metadata
         self.input_size = (
-            CONVERSATIONAL_HIDDEN_DIM
+            H_CONVERSATIONAL_HIDDEN_DIM
             + cat_embed_dim
             + numerical_dim
-            + (BYTE_CONTEXT_LEN * BYTE_EMBED_DIM)
+            + (H_BYTE_CONTEXT_LEN * BYTE_EMBED_DIM)
         )
 
         # Decoder LSTM for payload generation
         self.decoder_lstm = nn.LSTM(
             input_size=self.input_size,
-            hidden_size=CONVERSATIONAL_HIDDEN_DIM,
-            num_layers=NEXT_PACKET_LAYERS,
+            hidden_size=H_CONVERSATIONAL_HIDDEN_DIM,
+            num_layers=H_NEXT_PACKET_LAYERS,
             batch_first=True,
-            dropout=NEXT_PACKET_DROPOUT,
+            dropout=H_NEXT_PACKET_DROPOUT,
         )
 
         # Output projection on just the 256 bytes excluding the special tokens
-        self.output_projection = nn.Linear(
-            CONVERSATIONAL_HIDDEN_DIM, OUTPUT_VOCAB_DIM
-        )
+        self.output_projection = nn.Linear(H_CONVERSATIONAL_HIDDEN_DIM, VOCAB_DIM)
 
         # Byte embedding for decoder
-        self.byte_embedding = nn.Embedding(INT, BYTE_EMBED_DIM)
+        self.byte_embedding = nn.Embedding(VOCAB_DIM, BYTE_EMBED_DIM)
+
+        self.hidden = None
+
+    def embed_cats(self, cat_fs: torch.Tensor):
+        # Embed next packet categorical features
+        cat_embeds = torch.cat(
+            [
+                embedding_layer(cat_f)
+                for cat_f, embedding_layer in zip(cat_fs, self.cat_embedder)
+            ],
+            dim=-1
+        )
+        return cat_embeds
 
     def forward(
         self,
@@ -272,14 +291,8 @@ class NextPacketPredictor(nn.Module):
         """
         batch_size = embedded_conversation_context.shape[0]
 
-        # Embed next packet categorical features
-        cat_embeds = []
-        for i, embedding_layer in enumerate(self.cat_embeddings):
-            cat_embeds.append(embedding_layer(next_packet_categorical[:, i]))
-
-        cat_embeds = (
-            torch.cat(cat_embeds, dim=-1) if cat_embeds else torch.empty(batch_size, 0)
-        )
+        # TEST: repeating process for cat embedding
+        cat_embeds = self.embed_cats(next_packet_categorical).repeat(batch_size)
 
         # Combine context with next packet metadata as predictors
         context = torch.cat(
@@ -324,7 +337,9 @@ class NextPacketPredictor(nn.Module):
         # Repeat context for each timestep in the payload so that we predict byte by byte
         # context_repeated = context.unsqueeze(1).repeat(1, max_len, 1) # [batch_size, max_length, ctx_len]
         lstm_input = torch.zeros(
-            (batch_size, max_len, self.input_size), dtype=torch.long, device=context.device
+            (batch_size, max_len, self.input_size),
+            dtype=torch.long,
+            device=context.device,
         )
 
         # initialize the empty lstm input
@@ -400,17 +415,27 @@ class NextPacketPredictor(nn.Module):
         )
 
         # Initialize hidden state
-        h = torch.zeros(self.decoder_lstm.num_layers, batch_size, 
-                    self.decoder_lstm.hidden_size, device=context.device)
-        c = torch.zeros(self.decoder_lstm.num_layers, batch_size, 
-                    self.decoder_lstm.hidden_size, device=context.device)
+        h = torch.zeros(
+            self.decoder_lstm.num_layers,
+            batch_size,
+            self.decoder_lstm.hidden_size,
+            device=context.device,
+        )
+        c = torch.zeros(
+            self.decoder_lstm.num_layers,
+            batch_size,
+            self.decoder_lstm.hidden_size,
+            device=context.device,
+        )
         hidden_state = (h, c)
 
         for i in range(max_len):
             # Encode only the prior bytes
-            byte_embeds = self.byte_embedding(
-                padded_pred_payload[:, i : i + BYTE_CONTEXT_LEN]
-            ).reshape(batch_size, -1).to(context.device)
+            byte_embeds = (
+                self.byte_embedding(padded_pred_payload[:, i : i + BYTE_CONTEXT_LEN])
+                .reshape(batch_size, -1)
+                .to(context.device)
+            )
 
             # make a copy of the context for the current timestamp
             context_step = context.unsqueeze(1)  # add another dimension to the tensor
@@ -503,9 +528,7 @@ class HierarchicalMQTTModel(nn.Module):
             numerical_feats = torch.stack([p.numerical_features for p in packet])
 
             # TODO: Test how this is encoded
-            packet_repr = self.packet_encoder(
-                payload, cat_feats, numerical_feats
-            )
+            packet_repr = self.packet_encoder(payload, cat_feats, numerical_feats)
             packet_representations.append(packet_repr)
 
         packet_representations = torch.stack(packet_representations, dim=1)

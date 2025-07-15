@@ -130,6 +130,7 @@ H_BYTE_CONTEXT_LEN = 32  # Number of current packet bytes to include in the cont
 H_PACKET_ENC_LAYERS = 2
 H_NEXT_PACKET_LAYERS = 2
 H_NEXT_PACKET_DROPOUT = 0.2
+H_TEMP = 1.0
 
 
 ### Simple lstm model params ###

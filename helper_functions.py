@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 ### Local imports ###
 from CONSTANTS import *
-from preprocessing import load_df
+from custom_datasets import PacketDataset
 
 
 ### Custom data classes ###
@@ -104,14 +104,74 @@ def plot_metrics(
     plt.show()
 
 
-def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0) -> int:
+def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
     if temp == 0:
-        return int(torch.argmax(logits, dim=-1))
+        return torch.argmax(logits, dim=-1)
 
     probs = F.softmax(logits / temp, dim=-1)
-    return int(torch.multinomial(probs, 1).squeeze(-1))
+    return torch.multinomial(probs, 1).squeeze(-1)
 
 
 def google_get_embedding_dim(n_cats: int) -> int:
     # Google's categorical embedding formuala
     return min(MAX_CAT_EMB, round((n_cats * CAT_EMB_SCALAR) ** CAT_EMB_EXPO))
+
+
+### Cross function variables ###
+conv_list = list()
+split_dict = {
+    "train": [],
+    "val": [],
+    "test": [],
+}
+
+### Helper functions ###
+def update_split_dict():
+    global split_dict, conv_list
+    n_convs = len(conv_list)
+    n_in_dict = np.sum([len(elem) for elem in split_dict.values()])
+    # Number of values to add for each category
+    n_train = int(TRAIN_VAL_TEST_PERCS[0] * n_convs) - len(split_dict["train"])
+    n_val = int(TRAIN_VAL_TEST_PERCS[1] * n_convs) - len(split_dict["val"])
+    n_test = n_convs - n_val - n_train - len(split_dict["test"])
+
+    # Now get how many are already in the split dict
+    new_conv_nums = list(range(n_in_dict, n_in_dict + n_train + n_val + n_test))
+    for key, n_nums in zip(split_dict.keys(), (n_train, n_val, n_test)):
+        for _ in range(n_nums):
+            # We randomly choose which category each conversation nubmer should go to
+            conv_num = new_conv_nums.pop(np.random.randint(0, len(new_conv_nums)))
+            split_dict[key].append(conv_num)
+
+    assert (
+        len(new_conv_nums) == 0
+    ), f"Remaining converstion number list length must be 0, not {len(new_conv_nums)}"
+
+def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
+    # update the splti dict
+    update_split_dict()
+
+    ret = {"train": [], "val": [], "test": []}
+    # Now use the indicies to split the conversations into train, validation, and test
+    # We assume that each conv_df has one and only one conversation number
+    for conv_df in conv_dfs:
+        for key, conv_nums in split_dict.items():
+            if conv_df.conv_num in conv_nums:
+                ret[key].append(conv_df)
+
+    return ret
+
+
+    
+### Custom loss functions ###
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing: float = P_SMOOTHING):
+        super().__init__()
+        self.smoothing = smoothing
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+        pred = pred.log_softmax(dim=-1)  # smooth winner takes all PDF
+        n_classes = pred.size(dim=-1)
+        true_dist = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
+        true_dist = true_dist * (1 - self.smoothing) + self.smoothing / n_classes
+        return torch.mean(torch.sum(-true_dist * pred, dim=-1))

@@ -36,15 +36,27 @@ from dataclasses import dataclass
 
 # Local imports
 from CONSTANTS import *
-from preprocessing import load_df, split_into_conversations
-from custom_datasets import PacketDataset, ParsedPacket, PacketWithContext
-from helper_functions import google_get_embedding_dim
+from preprocessing import load_df, load_dfs_from_dir, split_into_conversations
+from custom_datasets import PacketDataset, ParsedPacket
+from helper_functions import (
+    split_dict,
+    conv_list,
+    split_convs,
+    google_get_embedding_dim,
+    sample_with_temperature,
+    plot_metrics,
+    ConvResults, 
+    EpochResults,
+    LabelSmoothingCrossEntropy
+)
 
+### Globals ###
+g_cur_temperature = P_INITIAL_TEMPERATURE
 
 class PacketEncoder(nn.Module):
     """Encodes individual packet (metadata + payload) into fixed representation"""
 
-    def __init__(self, cat_dims: List[int], num_dims: int, device=DEVICE):
+    def __init__(self, cat_dims: List[int], num_dims: int, device: str = DEVICE):
         super().__init__()
 
         # Byte embedding
@@ -68,10 +80,10 @@ class PacketEncoder(nn.Module):
         self.packet_lstm = nn.LSTM(
             input_size=packet_lstm_input_dim,
             hidden_size=H_PACKET_REP_DIM // 2,  # Will be bidirectional
-            num_layers=PACKET_ENC_LAYERS,
+            num_layers=H_PACKET_ENC_LAYERS,
             batch_first=True,
             bidirectional=True,
-            dropout=PACKET_ENC_DROPOUT,
+            dropout=H_PACKET_ENC_DROPOUT,
         )
 
         # Additional MLP to process metadata separately
@@ -167,7 +179,9 @@ class ConversationLSTM(nn.Module):
             dropout=H_CONVERSATIONAL_LSTM_DROPOUT,
         )
 
-    def forward(self, packet_representations, hidden_state=None):
+        self.hidden = None
+
+    def forward(self, packet_representations):
         """
         @Args:
             packet_representations: [batch, num_packets, packet_repr_dim]
@@ -176,10 +190,10 @@ class ConversationLSTM(nn.Module):
             conversation_outputs: [batch, num_packets, conversation_hidden_dim]
             final_hidden_state: Updated conversation state
         """
-        conversation_outputs, final_hidden_state = self.conversation_lstm(
-            packet_representations, hidden_state
+        conversation_outputs, self.hidden = self.conversation_lstm(
+            packet_representations, self.hidden
         )
-        return conversation_outputs, final_hidden_state
+        return conversation_outputs
 
     def init_hidden(self, batch_size, device):
         """Initialize conversation hidden state"""
@@ -269,7 +283,7 @@ class NextPacketPredictor(nn.Module):
                 embedding_layer(cat_f)
                 for cat_f, embedding_layer in zip(cat_fs, self.cat_embedder)
             ],
-            dim=-1
+            dim=-1,
         )
         return cat_embeds
 
@@ -292,7 +306,9 @@ class NextPacketPredictor(nn.Module):
         batch_size = embedded_conversation_context.shape[0]
 
         # TEST: repeating process for cat embedding
-        cat_embeds = self.embed_cats(next_packet_categorical).repeat(batch_size)
+        cat_embeds = (
+            self.embed_cats(next_packet_categorical).unsqueeze(1).repeat(1, batch_size)
+        )
 
         # Combine context with next packet metadata as predictors
         context = torch.cat(
@@ -331,7 +347,7 @@ class NextPacketPredictor(nn.Module):
 
         # Since we are dealing with variable payload lengths we will need to pack the payloads
         # This operates on the assumption that
-        mask = target_payload != NULL
+        mask = target_payload != MASK
         payload_lens = mask.sum(1)
 
         # Repeat context for each timestep in the payload so that we predict byte by byte
@@ -342,12 +358,15 @@ class NextPacketPredictor(nn.Module):
             device=context.device,
         )
 
+        # The target payload is batched
+
         # initialize the empty lstm input
         for i, payload in enumerate(target_payload):
+            # Pad the front so sequential context can easily be generated
             padded_payload_emb = self.byte_embedding(
                 torch.cat(
                     [
-                        torch.ones(BYTE_CONTEXT_LEN - 1, dtype=torch.long) * NULL,
+                        torch.ones(H_BYTE_CONTEXT_LEN - 1, dtype=torch.long) * MASK,
                         torch.tensor(SOS),
                         payload,
                     ],
@@ -357,7 +376,10 @@ class NextPacketPredictor(nn.Module):
             for j in range(0, max_len):
                 # Create the embeddings for the context
                 lstm_input[i, j] = torch.cat(
-                    [context, padded_payload_emb[j : j + BYTE_CONTEXT_LEN].reshape(-1)],
+                    [
+                        context,
+                        padded_payload_emb[j : j + H_BYTE_CONTEXT_LEN].reshape(-1),
+                    ],
                     dim=-1,
                 )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
 
@@ -368,7 +390,7 @@ class NextPacketPredictor(nn.Module):
         )
 
         # Process through decoder LSTM and unpad
-        packed_output, _ = self.decoder_lstm(packed_input)
+        packed_output, self.hidden = self.decoder_lstm(packed_input, self.hidden)
         decoder_output, _ = nn.utils.rnn.pad_packed_sequence(
             packed_output, batch_first=True
         )
@@ -376,7 +398,7 @@ class NextPacketPredictor(nn.Module):
         # Project to vocabulary
         logits = self.output_projection(decoder_output)
 
-        return logits  # [batch_size, payload_size, BYTE_VOCAB_SIZE - N_SPECIAL_TOKNES]
+        return logits  # [batch_size, payload_size, BYTE_VOCAB_SIZE - N_SPECIAL_TOKENS]
 
     def _generate_payload(
         self, context: torch.Tensor, msg_lens: torch.Tensor
@@ -404,35 +426,20 @@ class NextPacketPredictor(nn.Module):
 
         padded_pred_payload = torch.cat(
             [
-                torch.ones((batch_size, BYTE_CONTEXT_LEN - 1), dtype=torch.long)
-                * NULL,  # Prior null padding for index convienience
+                torch.ones((batch_size, H_BYTE_CONTEXT_LEN - 1), dtype=torch.long)
+                * MASK,  # Prior null padding for index convienience
                 torch.ones((batch_size, 1), dtype=torch.long)
                 * SOS,  # Add the start of sentence to align at index [0:BYTE_CONTEXT_LEN]
                 torch.ones((batch_size, max_len), dtype=torch.long)
-                * NULL,  # Allocation for the byte predictions
+                * MASK,  # Allocation for the byte predictions
             ],
             dim=-1,
         )
 
-        # Initialize hidden state
-        h = torch.zeros(
-            self.decoder_lstm.num_layers,
-            batch_size,
-            self.decoder_lstm.hidden_size,
-            device=context.device,
-        )
-        c = torch.zeros(
-            self.decoder_lstm.num_layers,
-            batch_size,
-            self.decoder_lstm.hidden_size,
-            device=context.device,
-        )
-        hidden_state = (h, c)
-
         for i in range(max_len):
             # Encode only the prior bytes
             byte_embeds = (
-                self.byte_embedding(padded_pred_payload[:, i : i + BYTE_CONTEXT_LEN])
+                self.byte_embedding(padded_pred_payload[:, i : i + H_BYTE_CONTEXT_LEN])
                 .reshape(batch_size, -1)
                 .to(context.device)
             )
@@ -445,15 +452,17 @@ class NextPacketPredictor(nn.Module):
             )  # [batch_size, full_context_size]
 
             # Get the LSTM output for the given input
-            output, hidden_state = self.decoder_lstm(lstm_input, hidden_state)
+            output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
 
             logits = self.output_projection(
                 output[:, -1, :]
             )  # Only gets the very last prediction
-            # Select the most likely byte for each
-            pred_byte = logits.argmax(dim=-1)
 
-            padded_pred_payload[:, i + BYTE_CONTEXT_LEN] = pred_byte
+            # Select the most likely byte for each
+            # pred_byte = logits.argmax(dim=-1)
+            pred_byte = sample_with_temperature(logits, temp=H_TEMP)
+
+            padded_pred_payload[:, i + H_BYTE_CONTEXT_LEN] = pred_byte
 
         # Now create attention mask for each msg length
         attn_masks = torch.tensor(
@@ -465,27 +474,27 @@ class NextPacketPredictor(nn.Module):
         return [
             payload[attn_mask]
             for payload, attn_mask in zip(
-                padded_pred_payload[:, BYTE_CONTEXT_LEN:], attn_masks
+                padded_pred_payload[:, H_BYTE_CONTEXT_LEN:], attn_masks
             )
         ]
 
 
-class HierarchicalMQTTModel(nn.Module):
+class HeirarchicalMQTTModel(nn.Module):
     """Complete hierarchical model for MQTT conversation modeling"""
 
     def __init__(
-        self, categorical_dims: list | tuple, numerical_dim: int, device: str = DEVICE
+        self, categorical_dims: List[int], numerical_dim: int, device: str = DEVICE
     ):
         super().__init__()
 
         self.packet_encoder = PacketEncoder(
-            categorical_dims=categorical_dims, numerical_dim=numerical_dim
+            cat_dims=categorical_dims, num_dims=numerical_dim
         )
 
         self.conversation_lstm = ConversationLSTM()
 
         self.next_packet_predictor = NextPacketPredictor(
-            categorical_dims=categorical_dims, numerical_dim=numerical_dim
+            cat_dims=categorical_dims, numerical_dim=numerical_dim
         )
 
         self.to(device)
@@ -496,7 +505,6 @@ class HierarchicalMQTTModel(nn.Module):
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
         target_payload: torch.Tensor | None = None,
-        attn_mask: torch.Tensor | None = None,
     ):
         """
         @Description: Computes the forward step for for a batch of contexts and packets
@@ -534,22 +542,24 @@ class HierarchicalMQTTModel(nn.Module):
         packet_representations = torch.stack(packet_representations, dim=1)
 
         # Process through conversation LSTM
-        conversation_outputs, _ = self.conversation_lstm(packet_representations)
+        conversation_outputs = self.conversation_lstm(packet_representations)
 
         # Use final conversation state to predict next packet
         final_conversation_context = conversation_outputs[:, -1, :]
 
         # Predict next packet payload
-        logits = self.next_packet_predictor(
+        logits = self.next_packet_predictor.forward(
             final_conversation_context,
             next_cat,
             next_numerical,
             target_payload,
-            attn_mask,
         )
 
         return logits
 
+    def reset_hidden(self):
+        self.conversation_lstm.hidden = None
+        self.next_packet_predictor.hidden = None
 
 ### Training section ###
 def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
@@ -667,93 +677,245 @@ def train_conv(model, conv_df: PacketDataset, optimizer, criterion):
 
     return total_loss / batch_count if batch_count > 0 else float("inf")
 
+    
 
-def model_train():
-    # Get the dataset for the conversation data
-    df = load_df()
+def run_conv(
+    model: HeirarchicalMQTTModel,
+    conv_df: PacketDataset,
+    optimizer,
+    criterion,
+    train: bool = True,
+    show_plots: bool = DEBUG_MODE,
+) -> Tuple[float, float]:
+    """
+    @Description: Takes an conversation and runs the training or validation on that packet
 
-    # Each packet dataset represent all the parsed packets in a single conversation
-    # Each packet is split into a batch based on the byte sequence for training and comes with
-    # some metadata and such as categorical and numerical features.
-    splits = split_into_conversations(df)
-    n_convs = len(splits)
-    conv_dfs = [PacketDataset(df, n_convs=n_convs) for df in splits]
+    @Notes:
+        - Each packet requires an embeded context of other packets
+        - The packet itself is predicted byte by byte either auto regressively or by trainer forcing
+        - At the moment we only work with batch sizes of one packet
+        
+    @Returns:
+    """
+    conv_loss = list()
+    conv_acc = list()
 
-    if len(conv_dfs) == 0:
-        print(f"Number of conversations must not be zero")
-        return
+    context = list()
 
-    # Get the categorical and numerical dimensions they will all be the same throughout the conversations
-    cat_dims = conv_dfs[0].cat_dims
-    numerical_dim = conv_dfs[0].num_dim
+    model.reset_hidden()
 
-    # Define the cross entropy loss model and optimizer
-    mqtt_model = HierarchicalMQTTModel(cat_dims, numerical_dim, device=DEVICE)
+    tot_cnt = 0
+    tot_good_cnt = 0
+    batch_num = 1
+    mode = "Train" if train else "Validation"
 
-    # Now create the optimizer and criterion
-    optimizer = torch.optim.Adam(
-        mqtt_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    # Go through the packets by batch size and perform the training step for each batch
+    while True:
+        try:
+            cur_packet = next(conv_df)
+        except StopIteration:
+            break
+
+
+    if show_plots:
+        plot_metrics(
+            conv_loss,
+            f"Conv {conv_df.conv_num} loss in ({mode})",
+            x_label="Batches",
+            y_label="Batch Loss",
+        )
+        plot_metrics(
+            conv_acc,
+            f"Conv {conv_df.conv_num} accuracy in ({mode})",
+            x_label="Batches",
+            y_label="Batch accuracy",
+        )
+
+    return (
+        float(np.mean(conv_loss)),
+        tot_good_cnt / tot_cnt if tot_cnt > 0 else float("inf"),
     )
 
-    criterion = nn.CrossEntropyLoss(reduction="mean")
+def train_epoch(
+    conv_dfs: List[PacketDataset],
+    model: HeirarchicalMQTTModel,
+    optimizer,
+    show_plots: bool = DEBUG_MODE,
+) -> EpochResults:
+    """
+    @Description: Runs the entier set of conversation data frames through the training and 
+    validation process.
+    
+    @Notes: 
+        - The training and validaton is done at the packet level
+    
+    @Returns:
+    """
+    results = EpochResults()
+    criterion = LabelSmoothingCrossEntropy(smoothing=P_SMOOTHING)
+
+    # Divide each conversation into testing, training, and validation splits
+    train, validation, test = split_convs(conv_dfs).values()
+
+    print(f"split dict: {split_dict}")
+
+    # Set the model in training mode
+    model.train()
+    epoch_loss = 0.0
+    epoch_acc = 0.0
+
+    for conv_df in train:
+        avg_loss, avg_acc = run_conv(
+            model, conv_df, optimizer, criterion, train=True, show_plots=show_plots
+        )
+        epoch_loss += avg_loss
+        epoch_acc += avg_acc
+
+    results.avg_train_loss = epoch_loss / len(conv_dfs)
+
+    results.avg_train_acc = epoch_acc / len(conv_dfs)
+
+    # now switch to validation
+    print("Switching to validation")
+    model.eval()
+    val_loss = 0.0
+    val_acc = 0.0
+
+    with torch.no_grad():
+        for conv_df in validation:
+            avg_loss, avg_acc = run_conv(
+                model,
+                conv_df,
+                optimizer,
+                criterion,
+                train=False,
+                show_plots=show_plots,
+            )
+            val_loss += avg_loss
+            val_acc += avg_acc
+
+    results.avg_val_loss = val_loss / len(conv_dfs)
+
+    results.avg_val_acc = val_acc / len(conv_dfs)
+
+    return results
+
+
+# Get the byte sequence
+def model_train(csv_dir: str):
+    global g_cur_temperature
 
     # Metrics
     best_val_loss = float("inf")
     train_losses = list()
     val_losses = list()
+    train_accs = list()
+    val_accs = list()
+
+    # Declare empty model, optimizer and criterion
+    heirachical_lstm = None
+    optimizer = None
+    scheduler = None
 
     # Now train over n training epochs
     for epoch in range(N_EPOCHS):
+        g_cur_temperature = P_INITIAL_TEMPERATURE * (1 - epoch / N_EPOCHS)
+        dfs = load_dfs_from_dir(csv_dir=csv_dir)
+        for df in dfs:
+            # Get the conversations splits
+            splits = split_into_conversations(df, conv_list=conv_list)
 
-        # Divide each conversation into testing, training, and validation splits
-        train, validation, test = split_convs(conv_dfs).values()
+            conv_dfs = [
+                PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
+            ]
 
-        # Set the model in training mode
-        mqtt_model.train()
-        epoch_loss = 0.0
-        for conv_df in train:
-            conv_loss = train_conv(mqtt_model, conv_df, optimizer, criterion)
-            epoch_loss += conv_loss
-        avg_train_loss = epoch_loss / len(conv_dfs)
-        train_losses.append(avg_train_loss)
+            # Since we now have the features and dimensions we can initialize the model
+            if heirachical_lstm is None:
+                cat_dims = conv_dfs[0].cat_dims
+                num_dims = conv_dfs[0].num_dims
+                heirachical_lstm = HeirarchicalMQTTModel(
+                    categorical_dims=cat_dims, numerical_dim=num_dims, device=DEVICE
+                )
+                optimizer = torch.optim.Adam(
+                    heirachical_lstm.parameters(),
+                    lr=P_LEARNING_RATE,
+                    weight_decay=P_WEIGHT_DECAY,
+                )
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer=optimizer, mode="min", factor=0.1, patience=10
+                )
 
-        # now switch to validation
-        mqtt_model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for conv_df in validation:
-                conv_loss = train_conv(mqtt_model, conv_df, optimizer, criterion)
-                val_loss += conv_loss
-        avg_val_loss = val_loss / len(conv_dfs)
-        val_losses.append(avg_val_loss)
-
-        # Model checkpointing
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": mqtt_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "train_loss": avg_train_loss,
-                    "val_loss": avg_val_loss,
-                },
-                f"checkpoints/model_epoch_{epoch}.pt",
+            results = train_epoch(
+                conv_dfs, heirachical_lstm, optimizer=optimizer, show_plots=False
             )
 
-        # Print metrics
-        print(f"Epoch {epoch+1}/{N_EPOCHS}:")
-        print(f"  Training Loss: {avg_train_loss:.4f}")
-        print(f"  Validation Loss: {avg_val_loss:.4f}")
+            print(f"Epoch {epoch+1}/{N_EPOCHS}:")
+            print(f"  Training Loss: {results.avg_train_loss:.4f}")
+            print(f"  Training Acc: {results.avg_train_acc:.4f}")
 
-        # Early stopping check
-        if len(val_losses) > PATIENCE:
-            if all(val_losses[-PATIENCE:] > best_val_loss):
-                print("Early stopping triggered")
-                break
+            train_losses.append(results.avg_train_loss)
+            train_accs.append(results.avg_train_acc)
+            val_losses.append(results.avg_val_loss)
+            val_accs.append(results.avg_val_acc)
 
-    return mqtt_model, train_losses, val_losses
+            # Update the training parameters
+            scheduler.step(results.avg_val_loss)
 
+            # Model checkpointing
+            if results.avg_val_loss < best_val_loss:
+                best_val_loss = results.avg_val_loss
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": heirachical_lstm.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "train_loss": results.avg_train_loss,
+                        "val_loss": results.avg_val_loss,
+                    },
+                    f"source_code/checkpoints/model_epoch_{epoch}.pt",
+                )
+
+            # Print metrics
+            print(f"Epoch {epoch+1}/{N_EPOCHS}:")
+            print(f"  Validation Loss: {results.avg_val_loss:.4f}")
+            print(f"  Validation Acc: {results.avg_val_acc:.4f}")
+
+            # Early stopping check
+            if len(val_losses) > PATIENCE:
+                if all([v > best_val_loss for v in val_losses[-PATIENCE:]]):
+                    print("Early stopping triggered")
+                    break
+
+            # Process the dfs into packet datasets
+            conv_dfs = [
+                PacketDataset(conv_df, n_convs=len(splits)) for conv_df in splits
+            ]
+
+        # Plot the metrics over the training process
+        plot_metrics(
+            train_losses,
+            title=f"Overall training loss",
+            x_label="epoch",
+            y_label="Loss",
+        )
+        plot_metrics(
+            train_accs,
+            title=f"Overall training accuracy",
+            x_label="epoch",
+            y_label="Accuracy",
+        )
+        plot_metrics(
+            val_losses,
+            title=f"Overall validation loss",
+            x_label="epoch",
+            y_label="Loss",
+        )
+        plot_metrics(
+            val_accs,
+            title=f"Overall validation accuracy",
+            x_label="epoch",
+            y_label="Accuracy",
+        )
 
 if __name__ == "__main__":
     #

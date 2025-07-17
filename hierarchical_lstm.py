@@ -31,7 +31,7 @@
 
 import torch
 import torch.nn as nn
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
 
 # Local imports
@@ -45,13 +45,14 @@ from helper_functions import (
     google_get_embedding_dim,
     sample_with_temperature,
     plot_metrics,
-    ConvResults, 
+    ConvResults,
     EpochResults,
-    LabelSmoothingCrossEntropy
+    LabelSmoothingCrossEntropy,
 )
 
 ### Globals ###
 g_cur_temperature = P_INITIAL_TEMPERATURE
+
 
 class PacketEncoder(nn.Module):
     """Encodes individual packet (metadata + payload) into fixed representation"""
@@ -293,7 +294,7 @@ class NextPacketPredictor(nn.Module):
         next_packet_categorical: torch.Tensor,
         next_packet_numerical: torch.Tensor,
         target_payload: None | torch.Tensor = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         @Args:
             conversation_context: [batch, conversation_hidden_dim]
@@ -302,13 +303,10 @@ class NextPacketPredictor(nn.Module):
             target_payload: [batch, payload_length] - for teacher forcing during training
         @Notes:
             - The mqtt.len is the third arguement in the numerical features
+            - This can only handle a single packet a time. Not multiple batches
         """
-        batch_size = embedded_conversation_context.shape[0]
-
         # TEST: repeating process for cat embedding
-        cat_embeds = (
-            self.embed_cats(next_packet_categorical).unsqueeze(1).repeat(1, batch_size)
-        )
+        cat_embeds = self.embed_cats(next_packet_categorical)
 
         # Combine context with next packet metadata as predictors
         context = torch.cat(
@@ -316,15 +314,18 @@ class NextPacketPredictor(nn.Module):
         )
 
         if target_payload is None:
-            # Get the mqtt length as the third argument in the numerical features
-            lengths = next_packet_numerical[:, 2]
             # Inference mode - autoregressive generation
-            return self._generate_payload(context, lengths)
+            logits, preds = self._generate_payload(context)
         else:
             # Training mode - teacher forcing
-            return self._train_forward(context, target_payload)
+            logits = self._train_forward(context, target_payload)
+            preds = logits.argmax(dim=-1)
 
-    def _train_forward(self, context: torch.Tensor, target_payload: torch.Tensor):
+        return logits, preds
+
+    def _train_forward(
+        self, context: torch.Tensor, target_payload: torch.Tensor
+    ) -> torch.Tensor:
         """
         @Description: Uses the batch contexts along the prior embedded next packet features
         to predict the entire sequence of next bytes for the target packet.
@@ -338,71 +339,46 @@ class NextPacketPredictor(nn.Module):
             allow the model to learn that it should stop at mqtt.length
 
         @Returns:
-            logits: torch.tensor([]) -> [batch_size, payload_length, BYTE_VOCAB_DIMS]
+            logits: torch.tensor([]) -> [payload_length, BYTE_VOCAB_DIMS]
         """
-        batch_size, max_len = target_payload.shape  # [batch_size, payload_length]
-        ctx_batch_size, ctx_embedded_len = (
-            context.shape
-        )  # [batch_size, packet_ctx_len + meta_data_embed_len]
+        assert len(target_payload.shape) == 1, f"The target payload must be 1D"
+        assert len(context.shape) == 1, f"The context tensor must be 1D"
 
-        # Since we are dealing with variable payload lengths we will need to pack the payloads
-        # This operates on the assumption that
-        mask = target_payload != MASK
-        payload_lens = mask.sum(1)
+        payload_len = target_payload.shape[0]
+        lstm_input = torch.empty((payload_len, self.input_size), dtype=torch.long)
 
-        # Repeat context for each timestep in the payload so that we predict byte by byte
-        # context_repeated = context.unsqueeze(1).repeat(1, max_len, 1) # [batch_size, max_length, ctx_len]
-        lstm_input = torch.zeros(
-            (batch_size, max_len, self.input_size),
-            dtype=torch.long,
-            device=context.device,
-        )
-
-        # The target payload is batched
-
-        # initialize the empty lstm input
-        for i, payload in enumerate(target_payload):
-            # Pad the front so sequential context can easily be generated
-            padded_payload_emb = self.byte_embedding(
-                torch.cat(
-                    [
-                        torch.ones(H_BYTE_CONTEXT_LEN - 1, dtype=torch.long) * MASK,
-                        torch.tensor(SOS),
-                        payload,
-                    ],
-                    dim=-1,
-                )
+        padded_payload_emb = self.byte_embedding(
+            torch.cat(
+                [
+                    torch.tensor(
+                        [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS], dtype=torch.long
+                    ),
+                    target_payload,
+                ]
             )
-            for j in range(0, max_len):
-                # Create the embeddings for the context
-                lstm_input[i, j] = torch.cat(
-                    [
-                        context,
-                        padded_payload_emb[j : j + H_BYTE_CONTEXT_LEN].reshape(-1),
-                    ],
-                    dim=-1,
-                )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
-
-        # Combine context with decoder embeddings
-        # lstm_input = torch.cat([context_repeated, mask_embeds], dim=-1)
-        packed_input = nn.utils.rnn.pack_padded_sequence(
-            lstm_input, payload_lens.cpu(), batch_first=True, enforce_sorted=False
         )
 
-        # Process through decoder LSTM and unpad
-        packed_output, self.hidden = self.decoder_lstm(packed_input, self.hidden)
-        decoder_output, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_output, batch_first=True
-        )
+        for i in range(payload_len):
+            # Create the embeddings for the context
+            lstm_input[i, :] = torch.cat(
+                [
+                    context,
+                    padded_payload_emb[i : i + H_BYTE_CONTEXT_LEN].reshape(-1),
+                ],
+                dim=-1,
+            )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
+
+        # Process through decoder LSTM
+        output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
 
         # Project to vocabulary
-        logits = self.output_projection(decoder_output)
+        logits = self.output_projection(output)
 
-        return logits  # [batch_size, payload_size, BYTE_VOCAB_SIZE - N_SPECIAL_TOKENS]
+        return logits  # [payload_size, BYTE_VOCAB_SIZE]
 
     def _generate_payload(
-        self, context: torch.Tensor, msg_lens: torch.Tensor
-    ) -> List[torch.Tensor]:
+        self, context: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         @Description: Goes through autoregressively predicting the packet payload byte by byte
 
@@ -416,67 +392,48 @@ class NextPacketPredictor(nn.Module):
         @Returns: List[torch.Tensor]
         """
         # Autoregressively predict the next byte in the packet, adding it to the context each time
-        ctx_batch_size, context_len = context.shape
-        batch_size = msg_lens.shape[0]
-        assert (
-            ctx_batch_size == batch_size
-        ), f"_generate_payload failed with batch size mismatch {batch_size} != {ctx_batch_size}"
+        assert len(context.shape) == 1, f"The context tensor must be 1D"
+        context_len = context.shape[0]
 
-        max_len = int(msg_lens.max())
-
-        padded_pred_payload = torch.cat(
-            [
-                torch.ones((batch_size, H_BYTE_CONTEXT_LEN - 1), dtype=torch.long)
-                * MASK,  # Prior null padding for index convienience
-                torch.ones((batch_size, 1), dtype=torch.long)
-                * SOS,  # Add the start of sentence to align at index [0:BYTE_CONTEXT_LEN]
-                torch.ones((batch_size, max_len), dtype=torch.long)
-                * MASK,  # Allocation for the byte predictions
-            ],
-            dim=-1,
+        padded_pred_payload = torch.tensor(
+            [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS] + [MASK] * context_len,
+            dtype=torch.long,
         )
 
-        for i in range(max_len):
+        all_logits = torch.empty(
+            (context_len, VOCAB_DIM), dtype=torch.float32, device=DEVICE
+        )
+
+        for i in range(context_len):
             # Encode only the prior bytes
-            byte_embeds = (
-                self.byte_embedding(padded_pred_payload[:, i : i + H_BYTE_CONTEXT_LEN])
-                .reshape(batch_size, -1)
-                .to(context.device)
-            )
+            byte_embeds = self.byte_embedding(
+                padded_pred_payload[i : i + H_BYTE_CONTEXT_LEN]
+            ).to(context.device)
 
             # make a copy of the context for the current timestamp
             context_step = context.unsqueeze(1)  # add another dimension to the tensor
 
             lstm_input = torch.cat(
                 [context_step, byte_embeds], dim=1
-            )  # [batch_size, full_context_size]
+            )  # [full_context_size]
 
             # Get the LSTM output for the given input
             output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
 
             logits = self.output_projection(
-                output[:, -1, :]
+                output
             )  # Only gets the very last prediction
 
             # Select the most likely byte for each
             # pred_byte = logits.argmax(dim=-1)
             pred_byte = sample_with_temperature(logits, temp=H_TEMP)
 
-            padded_pred_payload[:, i + H_BYTE_CONTEXT_LEN] = pred_byte
+            padded_pred_payload[i + H_BYTE_CONTEXT_LEN] = pred_byte
 
-        # Now create attention mask for each msg length
-        attn_masks = torch.tensor(
-            [[1] * s_len + [0] * (max_len - s_len) for s_len in msg_lens],
-            dtype=torch.bool,
-        )
+            all_logits[i, :] = logits
 
         # Now construct the sequence of output payload predictions
-        return [
-            payload[attn_mask]
-            for payload, attn_mask in zip(
-                padded_pred_payload[:, H_BYTE_CONTEXT_LEN:], attn_masks
-            )
-        ]
+        return all_logits, padded_pred_payload[H_BYTE_CONTEXT_LEN:]
 
 
 class HeirarchicalMQTTModel(nn.Module):
@@ -501,7 +458,7 @@ class HeirarchicalMQTTModel(nn.Module):
 
     def forward(
         self,
-        conversation_packets: torch.Tensor,
+        context_packets: List[ParsedPacket],
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
         target_payload: torch.Tensor | None = None,
@@ -521,25 +478,24 @@ class HeirarchicalMQTTModel(nn.Module):
 
         @Returns: logits distribution of next packet prediction.
         """
-        batch_size, context_length = conversation_packets.shape
+        assert (
+            len(context_packets) == H_PACKET_CTX
+        ), f"The conversation packets must have length {H_PACKET_CTX} not {len(context_packets)}"
 
         # Embedded packet shape: [byte_embeddings + cat_embed_dim + num_embed_dim]
         # individual embedding shape: [context_length, embedded_packet_length]
-        packet_representations = list()
-        for i in range(context_length):
-            # get the context packets
-            packet = conversation_packets[:, i]  # [batch_size, 1]
 
-            # extract the individual elements from each packets
-            payload = torch.stack([p.payload for p in packet])
-            cat_feats = torch.stack([p.cat_features for p in packet])
-            numerical_feats = torch.stack([p.numerical_features for p in packet])
-
-            # TODO: Test how this is encoded
-            packet_repr = self.packet_encoder(payload, cat_feats, numerical_feats)
-            packet_representations.append(packet_repr)
-
-        packet_representations = torch.stack(packet_representations, dim=1)
+        packet_representations = torch.stack(
+            [
+                self.packet_encoder(
+                    torch.tensor(packet.payload, dtype=torch.long, device=DEVICE),
+                    packet.cat_features,
+                    packet.numerical_features,
+                )
+                for packet in context_packets
+            ],
+            dim=0,
+        ).unsqueeze(0)
 
         # Process through conversation LSTM
         conversation_outputs = self.conversation_lstm(packet_representations)
@@ -561,6 +517,7 @@ class HeirarchicalMQTTModel(nn.Module):
         self.conversation_lstm.hidden = None
         self.next_packet_predictor.hidden = None
 
+
 ### Training section ###
 def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
     train_idx = int(TRAIN_VAL_TEST_PERCS[0] * len(conv_dfs))
@@ -580,105 +537,6 @@ def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]
     }
 
 
-def training_step(model, batch: List[PacketWithContext], optimizer, criterion) -> float:
-    """
-    @Description: Each training step works to predict the next packet in the conversation.
-    To do this it requires a context of length CONV_CONTEXT_LEN and a target packet; the
-    next packet in the sequence.
-
-    @Notes:
-        - We are aiming to back prop a single gradient that applies to all the weights and
-        parameters of the LSTM model rather than performing and partitioned optimization.
-        The hierchical mqtt model is the front end for the rest of the model. Whatever we pass
-        to there we can use to optimize the entier model.
-        - A single step forward requires a context of past packets, next categorical and numerical
-        features and the target payload.
-        - When training we use a batch size defined in the constants file. In our batch we go
-        through incrementally packet by packet where the next row in a batch will have the last
-        target packet in its context.
-
-    @Returns:
-    """
-    # Parse the data into the proper format
-    conversation_packets = torch.stack([torch.stack(pc.context) for pc in batch]).to(
-        model.device
-    )  # [batch_size, context_len]
-    next_cat = torch.tensor([pd.target.cat_features for pd in batch]).to(
-        model.device
-    )  # [batch_size, cat_len]
-    next_numerical = torch.tensor([pd.target.numerical_features for pd in batch]).to(
-        model.device
-    )  # [batch_size, num_len]
-    # Now use the attention masks to ignore any predictions out of range
-    # Get max payload length in the batch
-    max_len = np.max([len(pd.target.padded_payload.input_bytes) for pd in batch])
-    target_payload = torch.stack(
-        [pd.target.padded_payload.input_bytes for pd in batch]
-    ).to(model.device)
-
-    attn_mask = torch.stack(
-        [pd.target.padded_payload.attention_mask for pd in batch]
-    ).to(
-        model.device
-    )  # [batch_size, max_seq_len]
-
-    optimizer.zero_grad()
-
-    # Reshape the logits to line up all the predictions across the batches
-    logits = model(
-        conversation_packets, next_cat, next_numerical, target_payload, attn_mask
-    )
-    batch_size, seq_len, vocab_size = logits.shape()
-    logits = logits.view(-1, vocab_size)
-
-    targets = target_payload.view(-1)
-    valid_inds = attn_mask.view(-1).bool()
-    valid_logits = logits[valid_inds]
-    valid_targets = targets[valid_inds]
-
-    # Pass into the criterion
-    loss = criterion(valid_logits, valid_targets)
-
-    # Back prop
-    loss.backward()
-    optimizer.step()
-
-    return loss.item()
-
-
-def train_conv(model, conv_df: PacketDataset, optimizer, criterion):
-    """
-    @Description: This does the batching and training for a given conversation
-
-    @Notes:
-
-    @Returns:
-    """
-    model.train()  # switches to training mode
-    total_loss = 0
-    batch_count = 0
-
-    # Go through the packets by batch size and perform the training step for each batch
-    while True:
-        batch = list()
-        for _ in range(BATCH_SIZE):
-            try:
-                batch.append(next(conv_df))
-            except StopIteration:
-                break
-
-        if len(batch) == 0:
-            break
-
-        # Process batch
-        loss = training_step(model, batch, optimizer, criterion)
-        total_loss += loss
-        batch_count += 1
-
-    return total_loss / batch_count if batch_count > 0 else float("inf")
-
-    
-
 def run_conv(
     model: HeirarchicalMQTTModel,
     conv_df: PacketDataset,
@@ -694,7 +552,7 @@ def run_conv(
         - Each packet requires an embeded context of other packets
         - The packet itself is predicted byte by byte either auto regressively or by trainer forcing
         - At the moment we only work with batch sizes of one packet
-        
+
     @Returns:
     """
     conv_loss = list()
@@ -704,18 +562,71 @@ def run_conv(
 
     model.reset_hidden()
 
-    tot_cnt = 0
-    tot_good_cnt = 0
+    byte_cnt = 0
+    correct_byte_cnt = 0
     batch_num = 1
     mode = "Train" if train else "Validation"
+    end_reached = False
 
     # Go through the packets by batch size and perform the training step for each batch
-    while True:
+    while not end_reached:
         try:
             cur_packet = next(conv_df)
         except StopIteration:
+            end_reached = True
             break
 
+        if len(cur_packet.payload) == 0:
+            continue
+
+        # Predict the next packet
+        target_payload = (
+            torch.tensor(cur_packet.payload, dtype=torch.long)
+            .to(device=DEVICE)
+            .unsqueeze(0)
+            if train
+            else None
+        )
+
+        logits, preds = model.next_packet_predictor.forward(
+            torch.tensor(context, dtype=torch.long, device=DEVICE).unsqueeze(0),
+            cur_packet.cat_features.unsqueeze(0).to(device=DEVICE),
+            cur_packet.numerical_features.unsqueeze(0).to(device=DEVICE),
+            target_payload=target_payload,
+        )
+
+        loss = criterion(logits, target_payload)
+        packet_loss = loss.item()
+
+        if train:
+            # Compute the loss
+            loss.backward()
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        else:
+            pass
+
+        packet_good_cnt = 0
+        for pred, correct in zip(preds, cur_packet.payload):
+            if pred == correct:
+                packet_good_cnt += 1
+                correct_byte_cnt += 1
+            byte_cnt += 1
+
+        conv_loss.append(packet_loss)
+        conv_acc.append(packet_good_cnt / len(cur_packet.payload))
+
+        context.append(
+            model.packet_encoder.forward(
+                torch.tensor([cur_packet.payload], dtype=torch.long),
+                cur_packet.cat_features.unsqueeze(0),
+                cur_packet.numerical_features.unsqueeze(0),
+            )
+        )
+        context = context[-H_PACKET_CTX:]
+
+        batch_num += 1
 
     if show_plots:
         plot_metrics(
@@ -733,8 +644,9 @@ def run_conv(
 
     return (
         float(np.mean(conv_loss)),
-        tot_good_cnt / tot_cnt if tot_cnt > 0 else float("inf"),
+        correct_byte_cnt / byte_cnt if byte_cnt > 0 else float("inf"),
     )
+
 
 def train_epoch(
     conv_dfs: List[PacketDataset],
@@ -743,12 +655,12 @@ def train_epoch(
     show_plots: bool = DEBUG_MODE,
 ) -> EpochResults:
     """
-    @Description: Runs the entier set of conversation data frames through the training and 
+    @Description: Runs the entier set of conversation data frames through the training and
     validation process.
-    
-    @Notes: 
+
+    @Notes:
         - The training and validaton is done at the packet level
-    
+
     @Returns:
     """
     results = EpochResults()
@@ -916,6 +828,7 @@ def model_train(csv_dir: str):
             x_label="epoch",
             y_label="Accuracy",
         )
+
 
 if __name__ == "__main__":
     #

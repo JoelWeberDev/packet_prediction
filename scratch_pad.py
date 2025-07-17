@@ -10,12 +10,12 @@ from CONSTANTS import *
 from copy import deepcopy
 
 
-t1 = torch.ones((10, 20))
-t2 = torch.zeros((20, 10))
+l = torch.tensor(range(10))
 
-print(torch.cat([t1.flatten(), t2.flatten()], dim=-1))
+print(l)
 
-t = torch.ones(10).unsqueeze(1).repeat(1, 10)
+print(torch.stack([l, torch.tensor(range(5, 15))], dim=0).unsqueeze(0).shape)
 
-print(t)
+t = torch.cat([l, torch.tensor([0] * 3)], dim=-1)
 
+print(t.reshape(-1))

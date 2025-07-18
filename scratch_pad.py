@@ -10,12 +10,7 @@ from CONSTANTS import *
 from copy import deepcopy
 
 
-l = torch.tensor(range(10))
+tens = [torch.tensor(range(i, i + 10)) for i in range(5)]
 
-print(l)
-
-print(torch.stack([l, torch.tensor(range(5, 15))], dim=0).unsqueeze(0).shape)
-
-t = torch.cat([l, torch.tensor([0] * 3)], dim=-1)
-
-print(t.reshape(-1))
+t = torch.stack(tens)
+print(t)

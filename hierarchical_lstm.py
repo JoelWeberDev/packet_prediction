@@ -103,7 +103,7 @@ class PacketEncoder(nn.Module):
 
     def forward(
         self,
-        payloads: torch.Tensor,
+        payload: torch.Tensor,
         cat_features: torch.Tensor,
         num_features: torch.Tensor,
     ):
@@ -119,7 +119,9 @@ class PacketEncoder(nn.Module):
 
         @Returns:
         """
-        batch_size, ctx_len = payloads.shape
+        assert (
+            len(payload.shape) == 1
+        ), f"The payload must be 1D, not {len(payload.shape)}"
 
         # Embed the categorical features using the cat embeddings from above
         cat_emb = torch.cat(
@@ -131,25 +133,19 @@ class PacketEncoder(nn.Module):
         )
 
         # Embed bytes
-        byte_embeds = self.byte_embedder(payloads)  # [batch, seq_len, embed_dim]
+        byte_embeds = self.byte_embedder(payload)  # [payload_len, embed_dim]
 
         # Now pack the embeddings using the attention mask
-        lengths = (payloads == MASK).sum(dim=1).cpu()  # [batch_size]
-        packed_embeds = nn.utils.rnn.pack_padded_sequence(
-            byte_embeds, lengths, batch_first=True, enforce_sorted=False
-        )
 
         # Process through packet LSTM
-        lstm_output, _ = self.packet_lstm(packed_embeds)
-        lstm_output, _ = nn.utils.rnn.pad_packed_sequence(lstm_output, batch_first=True)
+        lstm_output, _ = self.packet_lstm(byte_embeds)
 
         # Take final hidden state as packet representation
-        packet_content_repr = lstm_output[:, -1, :]  # [batch, packet_repr_dim]
+        packet_content_repr = lstm_output[-1, :]  # [packet_repr_dim]
 
         assert packet_content_repr.shape == (
-            batch_size,
             H_PACKET_REP_DIM,
-        ), f"The packet shape of {packet_content_repr.shape} must equal {(batch_size, H_PACKET_REP_DIM)}"
+        ), f"The packet shape of {packet_content_repr.shape} must equal {(H_PACKET_REP_DIM,)}"
 
         # Process metadata separately
         metadata_input = torch.cat([cat_emb, num_features], dim=-1)
@@ -191,26 +187,12 @@ class ConversationLSTM(nn.Module):
             conversation_outputs: [batch, num_packets, conversation_hidden_dim]
             final_hidden_state: Updated conversation state
         """
-        conversation_outputs, self.hidden = self.conversation_lstm(
+        conversation_outputs, (h, c) = self.conversation_lstm(
             packet_representations, self.hidden
         )
-        return conversation_outputs
 
-    def init_hidden(self, batch_size, device):
-        """Initialize conversation hidden state"""
-        h = torch.zeros(
-            H_CONVERSATIONAL_LAYERS,
-            batch_size,
-            H_CONVERSATIONAL_HIDDEN_DIM,
-            device=device,
-        )
-        c = torch.zeros(
-            H_CONVERSATIONAL_LAYERS,
-            batch_size,
-            H_CONVERSATIONAL_HIDDEN_DIM,
-            device=device,
-        )
-        return (h, c)
+        self.hidden = (h.detach(), c.detach())
+        return conversation_outputs
 
 
 class NextPacketPredictor(nn.Module):
@@ -345,13 +327,17 @@ class NextPacketPredictor(nn.Module):
         assert len(context.shape) == 1, f"The context tensor must be 1D"
 
         payload_len = target_payload.shape[0]
-        lstm_input = torch.empty((payload_len, self.input_size), dtype=torch.long)
+        lstm_input = torch.empty(
+            (payload_len, self.input_size), dtype=torch.float32, device=DEVICE
+        )
 
         padded_payload_emb = self.byte_embedding(
             torch.cat(
                 [
                     torch.tensor(
-                        [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS], dtype=torch.long
+                        [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS],
+                        dtype=torch.long,
+                        device=DEVICE,
                     ),
                     target_payload,
                 ]
@@ -363,13 +349,14 @@ class NextPacketPredictor(nn.Module):
             lstm_input[i, :] = torch.cat(
                 [
                     context,
-                    padded_payload_emb[i : i + H_BYTE_CONTEXT_LEN].reshape(-1),
+                    padded_payload_emb[i : i + H_BYTE_CONTEXT_LEN].flatten(),
                 ],
                 dim=-1,
             )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
 
         # Process through decoder LSTM
-        output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
+        output, (h, c) = self.decoder_lstm(lstm_input, self.hidden)
+        self.hidden = (h.detach(), c.detach())
 
         # Project to vocabulary
         logits = self.output_projection(output)
@@ -385,6 +372,7 @@ class NextPacketPredictor(nn.Module):
         @Notes:
             - The length of the payload must be provided. Typically this is contained within
             the meta data.
+            - context: torch.tensor [H_CONVERSATION_CTX_LEN]
 
         @TEST:
             - Does this padded sequnce only predict for a single byte? What is the output shape?
@@ -406,19 +394,22 @@ class NextPacketPredictor(nn.Module):
 
         for i in range(context_len):
             # Encode only the prior bytes
-            byte_embeds = self.byte_embedding(
-                padded_pred_payload[i : i + H_BYTE_CONTEXT_LEN]
-            ).to(context.device)
+            byte_embeds = (
+                self.byte_embedding(padded_pred_payload[i : i + H_BYTE_CONTEXT_LEN])
+                .to(context.device)
+                .flatten()
+            )  # [H_BYTE_CONTEXT_LEN, BYTE_EMBED_SIZE]
 
             # make a copy of the context for the current timestamp
-            context_step = context.unsqueeze(1)  # add another dimension to the tensor
+            context_step = context  # add another dimension to the tensor
 
             lstm_input = torch.cat(
                 [context_step, byte_embeds], dim=1
             )  # [full_context_size]
 
             # Get the LSTM output for the given input
-            output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
+            output, (h, c) = self.decoder_lstm(lstm_input, self.hidden)
+            self.hidden = (h.detach(), c.detach())
 
             logits = self.output_projection(
                 output
@@ -458,7 +449,7 @@ class HeirarchicalMQTTModel(nn.Module):
 
     def forward(
         self,
-        context_packets: List[ParsedPacket],
+        context_packets_emb: torch.Tensor,
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
         target_payload: torch.Tensor | None = None,
@@ -478,40 +469,29 @@ class HeirarchicalMQTTModel(nn.Module):
 
         @Returns: logits distribution of next packet prediction.
         """
-        assert (
-            len(context_packets) == H_PACKET_CTX
-        ), f"The conversation packets must have length {H_PACKET_CTX} not {len(context_packets)}"
+        assert context_packets_emb.shape == (
+            H_PACKET_CTX,
+            H_PACKET_REP_DIM,
+        ), f"The conversation packets must have shape {(H_PACKET_CTX, H_PACKET_REP_DIM)} not {context_packets_emb.shape}"
 
         # Embedded packet shape: [byte_embeddings + cat_embed_dim + num_embed_dim]
         # individual embedding shape: [context_length, embedded_packet_length]
 
-        packet_representations = torch.stack(
-            [
-                self.packet_encoder(
-                    torch.tensor(packet.payload, dtype=torch.long, device=DEVICE),
-                    packet.cat_features,
-                    packet.numerical_features,
-                )
-                for packet in context_packets
-            ],
-            dim=0,
-        ).unsqueeze(0)
-
         # Process through conversation LSTM
-        conversation_outputs = self.conversation_lstm(packet_representations)
+        conversation_outputs = self.conversation_lstm(context_packets_emb)
 
         # Use final conversation state to predict next packet
-        final_conversation_context = conversation_outputs[:, -1, :]
+        final_conversation_context = conversation_outputs[-1, :]
 
         # Predict next packet payload
-        logits = self.next_packet_predictor.forward(
+        logits, preds = self.next_packet_predictor.forward(
             final_conversation_context,
             next_cat,
             next_numerical,
             target_payload,
         )
 
-        return logits
+        return logits, preds
 
     def reset_hidden(self):
         self.conversation_lstm.hidden = None
@@ -576,57 +556,55 @@ def run_conv(
             end_reached = True
             break
 
-        if len(cur_packet.payload) == 0:
-            continue
-
         # Predict the next packet
-        target_payload = (
-            torch.tensor(cur_packet.payload, dtype=torch.long)
-            .to(device=DEVICE)
-            .unsqueeze(0)
-            if train
-            else None
+        target_payload = torch.tensor([SOS] + cur_packet.payload, dtype=torch.long).to(
+            device=DEVICE
         )
 
-        logits, preds = model.next_packet_predictor.forward(
-            torch.tensor(context, dtype=torch.long, device=DEVICE).unsqueeze(0),
-            cur_packet.cat_features.unsqueeze(0).to(device=DEVICE),
-            cur_packet.numerical_features.unsqueeze(0).to(device=DEVICE),
-            target_payload=target_payload,
-        )
+        if len(context) == H_PACKET_CTX:
+            if len(cur_packet.payload) == 0:
+                continue
 
-        loss = criterion(logits, target_payload)
-        packet_loss = loss.item()
+            logits, preds = model.forward(
+                torch.stack(context).to(device=DEVICE),
+                cur_packet.cat_features.to(device=DEVICE),
+                cur_packet.numerical_features.to(device=DEVICE),
+                target_payload=target_payload if train else None,
+            )
 
-        if train:
-            # Compute the loss
-            loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            loss = criterion(logits, target_payload)
+            packet_loss = loss.item()
 
-        else:
-            pass
+            if train:
+                # Compute the loss
+                optimizer.zero_grad()
+                loss.backward()
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
-        packet_good_cnt = 0
-        for pred, correct in zip(preds, cur_packet.payload):
-            if pred == correct:
-                packet_good_cnt += 1
-                correct_byte_cnt += 1
-            byte_cnt += 1
+            else:
+                pass
 
-        conv_loss.append(packet_loss)
-        conv_acc.append(packet_good_cnt / len(cur_packet.payload))
+            packet_good_cnt = 0
+            for pred, correct in zip(preds, cur_packet.payload):
+                if pred == correct:
+                    packet_good_cnt += 1
+                    correct_byte_cnt += 1
+                byte_cnt += 1
+
+            batch_num += 1
+
+            conv_loss.append(packet_loss)
+            conv_acc.append(packet_good_cnt / len(cur_packet.payload))
 
         context.append(
             model.packet_encoder.forward(
-                torch.tensor([cur_packet.payload], dtype=torch.long),
-                cur_packet.cat_features.unsqueeze(0),
-                cur_packet.numerical_features.unsqueeze(0),
-            )
+                target_payload,
+                cur_packet.cat_features.to(device=DEVICE),
+                cur_packet.numerical_features.to(device=DEVICE),
+            ).detach()
         )
         context = context[-H_PACKET_CTX:]
-
-        batch_num += 1
 
     if show_plots:
         plot_metrics(
@@ -684,7 +662,6 @@ def train_epoch(
         epoch_acc += avg_acc
 
     results.avg_train_loss = epoch_loss / len(conv_dfs)
-
     results.avg_train_acc = epoch_acc / len(conv_dfs)
 
     # now switch to validation
@@ -831,5 +808,10 @@ def model_train(csv_dir: str):
 
 
 if __name__ == "__main__":
-    #
-    pass
+    ### Training entry point ###
+    # csv_dir = "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/legtimate_w1-1_split"
+    csv_dir = "test_data"
+    # csv_dir = (
+    #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    # )
+    model_train(csv_dir=csv_dir)

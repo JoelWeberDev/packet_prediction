@@ -91,7 +91,7 @@ METADATA_MLP_DROPOUT = 0.2
 
 
 ### Training parameters ###
-TRAIN_VAL_TEST_PERCS = np.array([0.70, 0.3, 0])
+TRAIN_VAL_TEST_PERCS = np.array([0.7, 0.3, 0])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
 N_EPOCHS = 10
@@ -131,6 +131,10 @@ H_PACKET_ENC_LAYERS = 2
 H_NEXT_PACKET_LAYERS = 2
 H_NEXT_PACKET_DROPOUT = 0.2
 H_TEMP = 1.0
+
+# Packet training parameters #
+H_MAX_TRAIN_CONV_PACKETS = 100
+H_MAX_VAL_CONV_PACKETS = 100
 
 
 ### Simple lstm model params ###

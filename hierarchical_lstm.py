@@ -45,6 +45,7 @@ from helper_functions import (
     google_get_embedding_dim,
     sample_with_temperature,
     plot_metrics,
+    print_update,
     ConvResults,
     EpochResults,
     LabelSmoothingCrossEntropy,
@@ -275,7 +276,7 @@ class NextPacketPredictor(nn.Module):
         embedded_conversation_context: torch.Tensor,  # embedded context
         next_packet_categorical: torch.Tensor,
         next_packet_numerical: torch.Tensor,
-        target_payload: None | torch.Tensor = None,
+        target_payload: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         @Args:
@@ -297,7 +298,7 @@ class NextPacketPredictor(nn.Module):
 
         if target_payload is None:
             # Inference mode - autoregressive generation
-            logits, preds = self._generate_payload(context)
+            logits, preds = self._generate_payload(context, int(target_payload.shape[0]))
         else:
             # Training mode - teacher forcing
             logits = self._train_forward(context, target_payload)
@@ -364,7 +365,7 @@ class NextPacketPredictor(nn.Module):
         return logits  # [payload_size, BYTE_VOCAB_SIZE]
 
     def _generate_payload(
-        self, context: torch.Tensor
+        self, context: torch.Tensor, payload_len: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         @Description: Goes through autoregressively predicting the packet payload byte by byte
@@ -381,30 +382,30 @@ class NextPacketPredictor(nn.Module):
         """
         # Autoregressively predict the next byte in the packet, adding it to the context each time
         assert len(context.shape) == 1, f"The context tensor must be 1D"
-        context_len = context.shape[0]
 
         padded_pred_payload = torch.tensor(
-            [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS] + [MASK] * context_len,
+            [MASK] * (H_BYTE_CONTEXT_LEN - 1) + [SOS] + [MASK] * payload_len,
             dtype=torch.long,
+            device=DEVICE,
         )
 
         all_logits = torch.empty(
-            (context_len, VOCAB_DIM), dtype=torch.float32, device=DEVICE
+            (payload_len, VOCAB_DIM), dtype=torch.float32, device=DEVICE
         )
 
-        for i in range(context_len):
+        for i in range(payload_len):
             # Encode only the prior bytes
             byte_embeds = (
                 self.byte_embedding(padded_pred_payload[i : i + H_BYTE_CONTEXT_LEN])
-                .to(context.device)
+                .to(DEVICE)
                 .flatten()
             )  # [H_BYTE_CONTEXT_LEN, BYTE_EMBED_SIZE]
 
             # make a copy of the context for the current timestamp
             context_step = context  # add another dimension to the tensor
 
-            lstm_input = torch.cat(
-                [context_step, byte_embeds], dim=1
+            lstm_input = torch.cat([context_step, byte_embeds], dim=-1).unsqueeze(
+                0
             )  # [full_context_size]
 
             # Get the LSTM output for the given input
@@ -452,7 +453,7 @@ class HeirarchicalMQTTModel(nn.Module):
         context_packets_emb: torch.Tensor,
         next_cat: torch.Tensor,
         next_numerical: torch.Tensor,
-        target_payload: torch.Tensor | None = None,
+        target_payload: torch.Tensor,
     ):
         """
         @Description: Computes the forward step for for a batch of contexts and packets
@@ -557,19 +558,19 @@ def run_conv(
             break
 
         # Predict the next packet
-        target_payload = torch.tensor([SOS] + cur_packet.payload, dtype=torch.long).to(
+        target_payload = torch.tensor(cur_packet.payload, dtype=torch.long).to(
             device=DEVICE
         )
 
-        if len(context) == H_PACKET_CTX:
-            if len(cur_packet.payload) == 0:
-                continue
+        if len(cur_packet.payload) == 0:
+            continue
 
+        if len(context) == H_PACKET_CTX:
             logits, preds = model.forward(
                 torch.stack(context).to(device=DEVICE),
                 cur_packet.cat_features.to(device=DEVICE),
                 cur_packet.numerical_features.to(device=DEVICE),
-                target_payload=target_payload if train else None,
+                target_payload=target_payload,
             )
 
             loss = criterion(logits, target_payload)
@@ -597,6 +598,18 @@ def run_conv(
             conv_loss.append(packet_loss)
             conv_acc.append(packet_good_cnt / len(cur_packet.payload))
 
+            if DEBUG_MODE:
+                print(f"Pred bytes: {preds}\ntarget bytes: {target_payload}\n")
+                # Print some helpful info about the training step
+                print_update(
+                    mode=mode,
+                    batch_num=batch_num,
+                    batch_size=len(cur_packet.payload),
+                    loss=packet_loss,
+                    batch_acc=conv_acc[-1],
+                    global_acc=correct_byte_cnt / byte_cnt,
+                )
+
         context.append(
             model.packet_encoder.forward(
                 target_payload,
@@ -605,6 +618,11 @@ def run_conv(
             ).detach()
         )
         context = context[-H_PACKET_CTX:]
+
+        if (train and batch_num > H_MAX_TRAIN_CONV_PACKETS) or (
+            not train and batch_num > H_MAX_VAL_CONV_PACKETS
+        ):
+            break
 
     if show_plots:
         plot_metrics(
@@ -647,7 +665,7 @@ def train_epoch(
     # Divide each conversation into testing, training, and validation splits
     train, validation, test = split_convs(conv_dfs).values()
 
-    print(f"split dict: {split_dict}")
+    print(f"n train {len(train)}, n val {len(validation)}")
 
     # Set the model in training mode
     model.train()
@@ -684,7 +702,6 @@ def train_epoch(
             val_acc += avg_acc
 
     results.avg_val_loss = val_loss / len(conv_dfs)
-
     results.avg_val_acc = val_acc / len(conv_dfs)
 
     return results
@@ -761,7 +778,7 @@ def model_train(csv_dir: str):
                         "train_loss": results.avg_train_loss,
                         "val_loss": results.avg_val_loss,
                     },
-                    f"source_code/checkpoints/model_epoch_{epoch}.pt",
+                    f"checkpoints/model_epoch_{epoch}.pt",
                 )
 
             # Print metrics

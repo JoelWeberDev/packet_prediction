@@ -32,10 +32,10 @@ from dataclasses import dataclass
 from copy import deepcopy
 
 ### Local imports ###
-from preprocessing import load_df, split_into_conversations, load_dfs_from_dir
-from custom_datasets import ByteStream, PacketDataset
-from CONSTANTS import *
-from helper_functions import (
+from modules.preprocessing import load_df, split_into_conversations, load_dfs_from_dir
+from modules.custom_datasets import ByteStream, PacketDataset
+from modules.CONSTANTS import *
+from modules.helper_functions import (
     ConvResults,
     EpochResults,
     LabelSmoothingCrossEntropy,
@@ -160,7 +160,7 @@ class NextByteLSTM(nn.Module):
 
 
 if __name__ == "__main__":
-    from helper_functions import conv_list, split_dict, update_split_dict, split_convs
+    from modules.helper_functions import conv_list, split_dict, update_split_dict, split_convs
 
     ### Training functions ###
     def run_payload(
@@ -490,7 +490,7 @@ if __name__ == "__main__":
                             "train_loss": results.avg_train_loss,
                             "val_loss": results.avg_val_loss,
                         },
-                        f"source_code/checkpoints/model_epoch_{epoch}.pt",
+                        f"checkpoints/model_epoch_{epoch}.pt",
                     )
 
                 # Print metrics

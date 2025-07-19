@@ -27,10 +27,10 @@ from typing import List, Dict, Tuple, Iterable
 from dataclasses import dataclass
 
 ### Local imports ###
-from preprocessing import load_df, split_into_conversations
-from custom_datasets import ConversationByteStream, Byte, ByteWithContext
-from CONSTANTS import *
-from helper_functions import ConvResults, get_memory, print_update, plot_metrics
+from modules.preprocessing import load_df, split_into_conversations
+from modules.custom_datasets import ConversationByteStream, Byte, ByteWithContext
+from modules.CONSTANTS import *
+from modules.helper_functions import ConvResults, get_memory, print_update, plot_metrics
 
 
 # Next byte predictor

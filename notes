@@ -1,0 +1,28 @@
+So my fundamental issue is repetition in our data. Since the conversations 
+always very structured and quite repetetive, we are suffering literally encoding the 
+patters within the model's weights. 
+This is a very bad strategy if you want to preform well when something new arises. In recurrent
+neural networks we have cell and memory states. These states are updated after each recurrent
+step and when used correctly encode the relations between past data. This effectively works as
+a long term context. We want to maximally rely on the hidden states and train the model parameters
+to rely on the memory.
+
+If the model has a decent understanding of the entire conversation it should be able to complete
+single shot packet prediction from the beginning without relying on auto regressive generation.
+The past packets context along with the current packet metadata will dictate how this packet should
+look right from the beginning.
+
+Here some ideas to accompish this
+  - More epochs with variable packets per conversation limit
+  - Data augmentation or abberation
+  - Reversal, predict the metadata from the payload
+  - Explicit past packet encoder
+  - External memory unit with reduced model parameters (the only option is to use memory)
+  - Reduction of byte embedding dim and increase in hidden size
+  - Loss function the penalizes memorization in the weights 
+    - Run the model for a number of steps
+    - Reset the hidden states
+    - Run the prediction again to get our logits
+    - Punish a small loss since this implies memorization in the absence of context
+
+

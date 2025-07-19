@@ -20,7 +20,7 @@ import pandas as pd
 from typing import Iterable
 
 # Local imports
-from CONSTANTS import *
+from modules.CONSTANTS import *
 
 
 ### Plotting functions ###

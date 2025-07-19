@@ -39,8 +39,8 @@ from dataclasses import dataclass
 from typing import Type, Union, Dict, List, Tuple, Iterator
 
 # Local imports
-from CONSTANTS import *
-import visualization as vis
+from modules.CONSTANTS import *
+import modules.visualization as vis
 
 
 ### object definitions ###

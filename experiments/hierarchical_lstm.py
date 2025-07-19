@@ -35,10 +35,10 @@ from typing import List, Dict, Tuple
 from dataclasses import dataclass
 
 # Local imports
-from CONSTANTS import *
-from preprocessing import load_df, load_dfs_from_dir, split_into_conversations
-from custom_datasets import PacketDataset, ParsedPacket
-from helper_functions import (
+from modules.CONSTANTS import *
+from modules.preprocessing import load_df, load_dfs_from_dir, split_into_conversations
+from modules.custom_datasets import PacketDataset, ParsedPacket
+from modules.helper_functions import (
     split_dict,
     conv_list,
     split_convs,
@@ -188,11 +188,10 @@ class ConversationLSTM(nn.Module):
             conversation_outputs: [batch, num_packets, conversation_hidden_dim]
             final_hidden_state: Updated conversation state
         """
-        conversation_outputs, (h, c) = self.conversation_lstm(
+        conversation_outputs, self.hidden = self.conversation_lstm(
             packet_representations, self.hidden
         )
 
-        self.hidden = (h.detach(), c.detach())
         return conversation_outputs
 
 
@@ -298,7 +297,9 @@ class NextPacketPredictor(nn.Module):
 
         if target_payload is None:
             # Inference mode - autoregressive generation
-            logits, preds = self._generate_payload(context, int(target_payload.shape[0]))
+            logits, preds = self._generate_payload(
+                context, int(target_payload.shape[0])
+            )
         else:
             # Training mode - teacher forcing
             logits = self._train_forward(context, target_payload)
@@ -356,8 +357,7 @@ class NextPacketPredictor(nn.Module):
             )  # [ctx_len + max_len * BYTE_EMBED_DIMS]
 
         # Process through decoder LSTM
-        output, (h, c) = self.decoder_lstm(lstm_input, self.hidden)
-        self.hidden = (h.detach(), c.detach())
+        output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
 
         # Project to vocabulary
         logits = self.output_projection(output)
@@ -409,8 +409,7 @@ class NextPacketPredictor(nn.Module):
             )  # [full_context_size]
 
             # Get the LSTM output for the given input
-            output, (h, c) = self.decoder_lstm(lstm_input, self.hidden)
-            self.hidden = (h.detach(), c.detach())
+            output, self.hidden = self.decoder_lstm(lstm_input, self.hidden)
 
             logits = self.output_projection(
                 output
@@ -447,6 +446,17 @@ class HeirarchicalMQTTModel(nn.Module):
         )
 
         self.to(device)
+
+    def detach_all_hidden(self):
+        if self.conversation_lstm.hidden is not None:
+            self.conversation_lstm.hidden = (self.conversation_lstm.hidden[0].detach(), self.conversation_lstm.hidden[1].detach())
+
+        if self.next_packet_predictor.hidden is not None:
+            self.next_packet_predictor.hidden = (self.next_packet_predictor.hidden[0].detach(), self.next_packet_predictor.hidden[1].detach())
+
+    def reset_hidden_states(self):
+        self.conversation_lstm.hidden = None
+        self.next_packet_predictor.hidden = None
 
     def forward(
         self,
@@ -494,10 +504,6 @@ class HeirarchicalMQTTModel(nn.Module):
 
         return logits, preds
 
-    def reset_hidden(self):
-        self.conversation_lstm.hidden = None
-        self.next_packet_predictor.hidden = None
-
 
 ### Training section ###
 def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
@@ -541,7 +547,7 @@ def run_conv(
 
     context = list()
 
-    model.reset_hidden()
+    model.reset_hidden_states()
 
     byte_cnt = 0
     correct_byte_cnt = 0
@@ -578,13 +584,19 @@ def run_conv(
 
             if train:
                 # Compute the loss
-                optimizer.zero_grad()
                 loss.backward()
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                optimizer.zero_grad()
 
             else:
                 pass
+
+            # Detach all the hidden states so the model can be trained
+            model.detach_all_hidden()
+
+            if np.random.random() < H_HIDDEN_RESET_PROB and train:
+                model.reset_hidden_states()
 
             packet_good_cnt = 0
             for pred, correct in zip(preds, cur_packet.payload):

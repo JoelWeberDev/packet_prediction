@@ -31,8 +31,8 @@ from copy import deepcopy
 from icecream import ic
 
 # Local imports
-from CONSTANTS import *
-from preprocessing import extract_features, split_into_conversations
+from modules.CONSTANTS import *
+from modules.preprocessing import extract_features, split_into_conversations
 
 
 ### Custom data structures ###

@@ -83,7 +83,7 @@ MAX_SEQ_LEN = (
     128  # Hard cap on the payload size anything beyond this will get cut short
 )
 CONV_CONTEXT_LEN = 10  # Number of packets in context
-BYTE_EMBED_DIM = 128  # Could be reduced since this is a major source of parameter count
+BYTE_EMBED_DIM = 32  # Could be reduced since this is a major source of parameter count
 
 
 PACKET_ENC_DROPOUT = 0.2
@@ -108,9 +108,9 @@ DEBUG_MODE = True
 ### Heiarchical Model settings ###
 
 # Conversational lstm params #
-H_CONVERSATIONAL_HIDDEN_DIM = 512
-H_CONVERSATIONAL_LAYERS = 3
-H_CONVERSATIONAL_LSTM_DROPOUT = 0.3
+H_CONVERSATIONAL_HIDDEN_DIM = 64
+H_CONVERSATIONAL_LAYERS = 2
+H_CONVERSATIONAL_LSTM_DROPOUT = 0.5
 
 # Packet encoder params #
 H_PACKET_CTX = 4
@@ -119,11 +119,11 @@ H_METADATA_HIDDEN_DIM = 64
 H_METADATA_DROPOUT = 0.3
 H_METADATA_OUTPUT_DIM = 32
 
-H_PACKET_REP_DIM = 256
+H_PACKET_REP_DIM = 64
 H_PACKET_ENC_LAYERS = 2
-H_PACKET_ENC_DROPOUT = 0.3
+H_PACKET_ENC_DROPOUT = 0.5
 H_PACKET_METADATA_SCALE = 0.5
-H_PACKET_COMBINER_DROPOUT = 0.2
+H_PACKET_COMBINER_DROPOUT = 0.5
 
 # Next packet prediction params #
 H_BYTE_CONTEXT_LEN = 32  # Number of current packet bytes to include in the context
@@ -133,8 +133,9 @@ H_NEXT_PACKET_DROPOUT = 0.2
 H_TEMP = 1.0
 
 # Packet training parameters #
-H_MAX_TRAIN_CONV_PACKETS = 100
-H_MAX_VAL_CONV_PACKETS = 100
+H_MAX_TRAIN_CONV_PACKETS = 400
+H_MAX_VAL_CONV_PACKETS = 400
+H_HIDDEN_RESET_PROB = 0.2
 
 
 ### Simple lstm model params ###
@@ -151,7 +152,7 @@ MAX_CAT_EMB = 50
 
 ### Primitive next byte predictor ###
 P_CTX_LEN = 32
-P_HIDDEN_SIZE = 128
+P_HIDDEN_SIZE = 512
 P_NUM_LAYERS = 2
 P_DROPOUT = 0.2
 P_LEARNING_RATE = 1e-3
@@ -164,6 +165,41 @@ P_INITIAL_TEMPERATURE = 0.9
 
 
 P_METADATA_DROPOUT = 0.5
-P_METADATA_HIDDEN_DIM = 64
+P_METADATA_HIDDEN_DIM = 128
 P_METADATA_OUTPUT_DIM = 32
 P_METADATA_SCALE = 0.5
+
+### New packet predictor ###
+# Dimensionality params #
+N_HIDDEN_SIZE = 256
+N_NUM_LAYERS = 2
+N_EMB_SIZE = 32
+N_DROPOUT = 0.2
+N_HIDDEN_DROPOUT = 0.1
+
+# Training params #
+N_MAX_CONV_PACKETS = 400
+N_MAX_PAYLOAD_LEN = 64
+N_TEACHER_FORCING_RATIO = 0.2
+N_NOISE_SCALE = 0.1
+N_MEM_RESET_PROB = 0.1
+N_SMOOTHING = 0.1
+N_LR = 1e-3
+N_MAX_LR = 3e-3
+N_WEIGHT_DECAY = 1e-5
+N_NUM_EPOCHS = 20
+N_MASK_PROB = 0.05
+
+
+### Pattern repetition GRU ###
+R_HIDDEN_SIZE = 256
+R_BYTE_EMBEDDED_SIZE = 8
+R_PATTERN_SIZE = 8
+R_MAX_SEQ_LEN = 64
+R_HIDDEN_RELIANCE_LOSS_SCALE = 200.0
+HIDDEN_RELIANCE_MARGIN = 0.1
+
+# Inference time params
+R_ADAPTATION_RATE = 0.1
+R_TEMPERATURE = 1.0
+R_SIMILARITY_THRESH = 0.8

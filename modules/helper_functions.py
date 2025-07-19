@@ -292,21 +292,23 @@ def diversity_loss(predictions: torch.Tensor, window_size: int = 5) -> torch.Ten
     """Penalize repetitive predictions within a sliding window"""
     if len(predictions) < window_size:
         return torch.tensor(0.0, device=predictions.device)
-    
+
     loss = torch.tensor(0.0, device=predictions.device)
     count = 0
     for i in range(len(predictions) - window_size + 1):
-        window = predictions[i:i + window_size]
+        window = predictions[i : i + window_size]
         unique_tokens = len(torch.unique(window))
         # Penalize low diversity (fewer unique tokens)
         diversity_score = unique_tokens / window_size
         loss += (1 - diversity_score) ** 2
         count += 1
-    
+
     return loss / max(1, count)
 
 
-def entropy_regularization(logits: torch.Tensor, target_entropy: float = 2.0) -> torch.Tensor:
+def entropy_regularization(
+    logits: torch.Tensor, target_entropy: float = 2.0
+) -> torch.Tensor:
     """Encourage higher entropy in predictions to prevent collapse"""
     probs = F.softmax(logits, dim=-1)
     entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
@@ -317,22 +319,22 @@ def entropy_regularization(logits: torch.Tensor, target_entropy: float = 2.0) ->
 def pattern_break_loss(hidden_states: List[torch.Tensor]) -> torch.Tensor:
     """Penalize similar hidden states across different time steps"""
     if len(hidden_states) < 2:
-        device = hidden_states[0].device if hidden_states else torch.device('cpu')
+        device = hidden_states[0].device if hidden_states else torch.device("cpu")
         return torch.tensor(0.0, device=device)
-    
+
     loss = torch.tensor(0.0, device=hidden_states[0].device)
     count = 0
-    
+
     # Compare hidden states across time steps
     for i in range(len(hidden_states)):
-        for j in range(i + 1, min(i + 5, len(hidden_states))):  # Compare with next 4 states
+        for j in range(
+            i + 1, min(i + 5, len(hidden_states))
+        ):  # Compare with next 4 states
             sim = F.cosine_similarity(
-                hidden_states[i].view(-1), 
-                hidden_states[j].view(-1), 
-                dim=0
+                hidden_states[i].view(-1), hidden_states[j].view(-1), dim=0
             )
             # Penalize high similarity
             loss += torch.relu(sim - 0.3)  # Only penalize if similarity > 0.3
             count += 1
-    
+
     return loss / max(1, count)

@@ -203,3 +203,15 @@ HIDDEN_RELIANCE_MARGIN = 0.1
 R_ADAPTATION_RATE = 0.1
 R_TEMPERATURE = 1.0
 R_SIMILARITY_THRESH = 0.8
+
+# Data augmentation parameters
+R_AUGMENT_PROB = 0.3  # Probability of applying augmentation
+R_TRUNCATE_PROB = 0.5  # Probability of truncation vs noise
+R_MIN_TRUNCATE_RATIO = 0.5  # Minimum fraction to keep when truncating
+R_MAX_NOISE_BYTES = 3  # Maximum number of bytes to add noise to
+R_HIDDEN_RESET_PROB = 0.15  # Probability of resetting hidden state
+
+# Anti-repetition parameters
+R_REPETITION_PENALTY = 0.2  # Penalty for recent tokens
+R_REPETITION_WINDOW = 5  # Lookback window for repetition penalty
+R_NUCLEUS_P = 0.9  # Top-p for nucleus sampling

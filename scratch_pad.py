@@ -10,15 +10,11 @@ from modules.CONSTANTS import *
 from copy import deepcopy
 
 
-t = torch.tensor(range(10))
+ts = torch.stack([torch.tensor(range(i, i + 10)) for i in range(7)])
 
+print(torch.sum(ts, dim=0))
 
-v = torch.tensor(range(10)).unsqueeze(1)
+w = torch.tensor(range(7))
+print(w.unsqueeze(0).reshape(7, -1) * ts)
 
-print(v[2:3])
-
-t1 = torch.ones(7, dtype=torch.float32)
-t2 = torch.tensor(range(7), dtype=torch.float32)
-
-print(torch.dot(t1, t2))
-print(t1.dot(t2))
+print(ts.shape)

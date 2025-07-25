@@ -94,7 +94,6 @@ METADATA_MLP_DROPOUT = 0.2
 TRAIN_VAL_TEST_PERCS = np.array([0.7, 0.3, 0])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
-N_EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
@@ -184,11 +183,12 @@ N_TEACHER_FORCING_RATIO = 0.2
 N_NOISE_SCALE = 0.1
 N_MEM_RESET_PROB = 0.1
 N_SMOOTHING = 0.1
-N_LR = 1e-3
-N_MAX_LR = 3e-3
+N_LR = 3e-3
+N_MAX_LR = 7e-3
 N_WEIGHT_DECAY = 1e-5
 N_NUM_EPOCHS = 20
 N_MASK_PROB = 0.05
+N_ACC_THRESH = 0.9
 
 
 ### Pattern repetition GRU ###
@@ -215,3 +215,18 @@ R_HIDDEN_RESET_PROB = 0.15  # Probability of resetting hidden state
 R_REPETITION_PENALTY = 0.2  # Penalty for recent tokens
 R_REPETITION_WINDOW = 5  # Lookback window for repetition penalty
 R_NUCLEUS_P = 0.9  # Top-p for nucleus sampling
+
+# Anti-memorization parameters
+R_SEQUENCE_SHUFFLE_PROB = 0.4  # Probability of shuffling parts of sequence
+R_SEQUENCE_DROP_PROB = 0.3  # Probability of dropping random bytes
+R_SEQUENCE_MASK_PROB = 0.2  # Probability of masking bytes with special token
+R_MAX_DROP_RATIO = 0.3  # Maximum fraction of sequence to drop
+R_MIN_KEEP_LENGTH = 3  # Minimum sequence length to keep
+
+# Curriculum learning parameters
+R_MEMORY_PRESSURE_EPOCHS = 8  # Number of epochs to apply memory pressure
+R_FORCE_GENERALIZATION = True  # Whether to force cross-conversation generalization
+
+MIN_MICRO_CONV_LEN = 20
+MAX_MICRO_CONV_LEN = 40
+MICRO_CONV_YIELD_PROB = 0.25

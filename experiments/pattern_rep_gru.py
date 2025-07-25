@@ -23,21 +23,20 @@ from dataclasses import dataclass
 
 ### Local imports ###
 from modules.CONSTANTS import *
-from modules.preprocessing import load_df, load_dfs_from_dir, split_into_conversations
-from modules.custom_datasets import PacketDataset
 from modules.helper_functions import (
-    split_dict,
-    conv_list,
-    split_convs,
     print_update,
     plot_metrics,
     hidden_reliance_loss,
     compute_hidden_state_regularization,
     LabelSmoothingCrossEntropy,
-    PacketIterator,
     diversity_loss,
     entropy_regularization,
-    pattern_break_loss,
+    sequence_memorization_loss,
+    apply_sequence_augmentation,
+    generate_loaders,
+    create_micro_conversations,
+    progressive_loss,
+    conversation_trajectory_loss,
 )
 
 
@@ -53,7 +52,7 @@ class AdaptivePacketGenerator(nn.Module):
         numerical_dim: int,
         hidden_size: int = R_HIDDEN_SIZE,
         embedding_size: int = R_BYTE_EMBEDDED_SIZE,
-        pattern_memory_size: int = R_PATTERN_SIZE,  # QQ what exactly does a hidden state vector represent?
+        pattern_memory_size: int = R_PATTERN_SIZE,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -87,14 +86,18 @@ class AdaptivePacketGenerator(nn.Module):
         self.byte_embedding = nn.Embedding(VOCAB_DIM, embedding_size)
         self.position_embedding = nn.Embedding(R_MAX_SEQ_LEN, embedding_size)
 
-        # Core GRU decoder with multiple layers
+        # Core GRU decoder with multiple layers and scheduled dropout
         self.decoder = nn.GRU(
             input_size=embedding_size + hidden_size,
             hidden_size=hidden_size,
             num_layers=2,
-            dropout=0.2,
+            dropout=0.3,  # Higher initial dropout
             batch_first=True,
         )
+
+        # Additional dropout layers for training control
+        self.adaptive_dropout = nn.Dropout(0.3)
+        self.current_dropout_rate = 0.3
 
         # Anti-repetition mechanism - track recent outputs
         self.register_buffer("recent_outputs", torch.zeros(10, VOCAB_DIM))
@@ -124,12 +127,24 @@ class AdaptivePacketGenerator(nn.Module):
         self.register_buffer("pattern_confidence", torch.zeros(pattern_memory_size))
         self.register_buffer("pattern_diversity", torch.zeros(pattern_memory_size))
 
+        # Cross-conversation memory for breaking sequence memorization
+        self.register_buffer(
+            "global_pattern_memory", torch.zeros(pattern_memory_size * 2, hidden_size)
+        )
+        self.register_buffer(
+            "global_pattern_usage", torch.zeros(pattern_memory_size * 2)
+        )
+        self.cross_conversation_blend_rate = 0.1
+
         # For inference adaptation
         self.adaptation_rate = R_ADAPTATION_RATE
         self.temperature = R_TEMPERATURE
         self.online_adaptation = False
         self.hidden = None
         self.position_counter = 0
+
+        # Sequence memorization tracking
+        self.sequence_memory = {}  # Track frequently seen sequences
 
     def encode_metadata(self, categorical, numerical):
         # Embed categorical features
@@ -153,12 +168,65 @@ class AdaptivePacketGenerator(nn.Module):
         self.online_adaptation = enable
         self.adaptation_rate = rate
 
+    def update_dropout_rate(self, epoch: int, total_epochs: int):
+        """Dynamically adjust dropout rate during training"""
+        # Higher dropout early, lower dropout later
+        base_rate = 0.3
+        min_rate = 0.1
+        progress = epoch / total_epochs
+
+        # Exponential decay of dropout rate
+        self.current_dropout_rate = (
+            min_rate + (base_rate - min_rate) * (1 - progress) ** 2
+        )
+        self.adaptive_dropout.p = self.current_dropout_rate
+
     def reset_patterns(self):
         """Reset learned patterns - call at the start of new conversations"""
+        # Save current patterns to global memory before reset
+        if self.pattern_usage.sum() > 0:
+            self.update_global_memory()
+
         self.pattern_memory.zero_()
         self.pattern_usage.zero_()
         self.pattern_confidence.zero_()
         self.pattern_diversity.zero_()
+
+    def update_global_memory(self):
+        """Update global cross-conversation memory"""
+        for i in range(self.pattern_memory_size):
+            if self.pattern_usage[i] > 0:
+                # Find least used slot in global memory
+                least_used_idx = torch.argmin(self.global_pattern_usage).item()
+
+                # Store pattern in global memory
+                self.global_pattern_memory[least_used_idx] = self.pattern_memory[
+                    i
+                ].clone()
+                self.global_pattern_usage[least_used_idx] = self.pattern_usage[i].item()
+
+    def inject_cross_conversation_noise(self):
+        """Inject patterns from other conversations to break memorization"""
+        if self.global_pattern_usage.sum() == 0 or not self.training:
+            return
+
+        # Randomly select and blend global patterns into current memory
+        for i in range(self.pattern_memory_size):
+            if random.random() < self.cross_conversation_blend_rate:
+                # Find a global pattern to blend
+                valid_global_indices = (
+                    (self.global_pattern_usage > 0).nonzero().squeeze()
+                )
+                if len(valid_global_indices) > 0:
+                    global_idx = random.choice(valid_global_indices.tolist())
+
+                    # Blend global pattern with noise
+                    noise = torch.randn_like(self.pattern_memory[i]) * 0.1
+                    self.pattern_memory[i] = (
+                        0.7 * self.pattern_memory[i]
+                        + 0.2 * self.global_pattern_memory[global_idx]
+                        + 0.1 * noise
+                    )
 
     def find_matching_pattern(self, query, threshold=0.7):
         """Find if current hidden state matches any stored pattern"""
@@ -283,8 +351,12 @@ class AdaptivePacketGenerator(nn.Module):
                 [byte_emb, metadata_enc.unsqueeze(0).unsqueeze(0)], dim=2
             )
 
-            # Pass through GRU
+            # Pass through GRU with adaptive dropout
             output, self.hidden = self.decoder(decoder_input, self.hidden)
+
+            # Apply adaptive dropout if training
+            if self.training:
+                output = self.adaptive_dropout(output)
 
             # Mixture of experts output
             gating_weights = F.softmax(
@@ -384,8 +456,7 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         pct_start=0.1,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(DEVICE)
 
     # Metrics #
     best_val_loss = float("inf")
@@ -401,23 +472,15 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         model.train()
         train_loss = 0.0
         train_acc = 0.0
-        train_hidden_rel_loss = 0.0
         total_bytes = 0
-        n_hidden_reliant = 0
 
         # Gradually decrease temperature and teacher forcing
         # Weight all the loss functions based on the current epoch
         # losses are in order [logits loss, hidden internal change loss, hidden reliance loss]
         epoch_ratio = epoch / (num_epochs - 1)
-        loss_weights = torch.tensor(
-            [0.8 * epoch_ratio, 0.2, 0.8 * (1 - epoch_ratio)],
-            dtype=torch.float32,
-            device=DEVICE,
-        )
 
         temperature = max(0.5, 1.0 - epoch_ratio)
         model.temperature = temperature
-        h_loss_margin = min(0.5, 0.1 + 0.4 * epoch_ratio)
         model.temperature = temperature
         # reset_probability = max(N_MEM_RESET_PROB, 0.9 - 0.8 * epoch_ratio)
         # tf_ratio = max(N_TEACHER_FORCING_RATIO, 1.0 - epoch * 1.5 / num_epochs)
@@ -442,129 +505,91 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
 
         model.temperature = temperature * temp_multiplier
 
+        # Update model dropout rate
+        model.update_dropout_rate(epoch, num_epochs)
+
         # Track conversation changes to reset memory appropriately
         last_conversation = None
         packets_in_conversation = 0
 
+        # Sequence memorization tracking - resets each epoch
+        sequence_memory_bank = {}
+
         for i, packet in enumerate(train_loader):
-            cat_features, num_features, payload = [b.to(device) for b in packet]
+            cat_features, num_features, payload = [b.to(DEVICE) for b in packet]
 
             if len(payload) == 0:
                 continue
 
-            # Check if we're in a new conversation (implement based on your data structure)
-            # This is a placeholder - you'll need to adapt based on how conversations are marked
-            current_conversation = getattr(packet, "conversation_id", None)
+            # Check if we're in a new conversation
+            current_conversation = packet[0][
+                3
+            ]  # Location of conversation number in packet
             if current_conversation != last_conversation:
                 model.reset_hidden()
                 model.reset_patterns()
+
+                # Inject cross-conversation patterns to force generalization
+                if epoch >= R_MEMORY_PRESSURE_EPOCHS // 2:
+                    model.inject_cross_conversation_noise()
+
                 packets_in_conversation = 0
                 last_conversation = current_conversation
 
             packets_in_conversation += 1
 
-            # Reset occasionally within long conversations to prevent overfitting
-            if packets_in_conversation > 50 and random.random() < 0.1:
+            # More aggressive resets for long conversations
+            if packets_in_conversation > 30 and random.random() < 0.15:
                 model.reset_hidden()
+
+            # Apply sequence augmentation (more aggressive early in training)
+            original_payload = payload.clone()
+            if epoch < R_MEMORY_PRESSURE_EPOCHS:
+                payload = apply_sequence_augmentation(payload, epoch, num_epochs)
 
             if len(payload) > max_seq_len:
                 payload = payload[:max_seq_len]
 
-            # Data augmentation: Random payload truncation and noise injection
-            if random.random() < R_AUGMENT_PROB:
-                if random.random() < R_TRUNCATE_PROB:  # Random truncation
+            # Track sequence frequency for memorization penalty
+            seq_key = str(tuple(payload.cpu().numpy()))
+            sequence_memory_bank[seq_key] = sequence_memory_bank.get(seq_key, 0) + 1
+
+            # Additional data augmentation with higher probability early on
+            aug_prob = R_AUGMENT_PROB * (2.0 if epoch < num_epochs // 3 else 1.0)
+            if random.random() < aug_prob:
+                if random.random() < R_TRUNCATE_PROB:
                     trunc_len = random.randint(
                         max(1, int(len(payload) * R_MIN_TRUNCATE_RATIO)), len(payload)
                     )
                     payload = payload[:trunc_len]
-                else:  # Add noise to a few bytes
+                else:
                     payload = payload.clone()
                     n_noise = random.randint(1, min(R_MAX_NOISE_BYTES, len(payload)))
                     noise_indices = random.sample(range(len(payload)), n_noise)
                     for idx in noise_indices:
                         payload[idx] = random.randint(0, 255)
 
-            # Reset hidden state randomly to break dependencies
-            if random.random() < R_HIDDEN_RESET_PROB:
+            # Strategic hidden state resets - more frequent early in training
+            reset_prob = R_HIDDEN_RESET_PROB * (2.0 if epoch < num_epochs // 4 else 1.0)
+            if random.random() < reset_prob:
                 model.reset_hidden()
-
-            # Store hidden states for pattern analysis
-            hidden_states = []
 
             optimizer.zero_grad()
             # Forward pass with scheduled teacher forcing
             logits, predictions = model.forward(cat_features, num_features, payload)
 
-            # Collect hidden states during forward pass for pattern analysis
-            if hasattr(model, "hidden") and model.hidden is not None:
-                hidden_states.append(model.hidden[-1].detach().clone())
-
-            # Compute primary loss
-            loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
-
-            # Hidden reliance loss
-            hidden_reliance = hidden_reliance_loss(
+            tot_loss = combo_loss(
                 model,
                 criterion,
+                logits,
+                payload,
+                predictions,
                 cat_features,
                 num_features,
-                payload,
-                loss,
-                scale=R_HIDDEN_RELIANCE_LOSS_SCALE,
-                margin=h_loss_margin,
+                epoch,
+                num_epochs,
+                sequence_memory_bank,
             )
-
-            # Hidden state regularization
-            hidden_loss = compute_hidden_state_regularization(model.hidden)
-
-            # New diversity and pattern breaking losses
-            diversity_loss_val = diversity_loss(predictions, window_size=5)
-            entropy_loss = entropy_regularization(logits, target_entropy=3.0)
-            pattern_loss = (
-                pattern_break_loss(hidden_states)
-                if len(hidden_states) > 1
-                else torch.tensor(0.0, device=device)
-            )
-
-            # Progressive loss weighting
-            if epoch < num_epochs // 4:
-                # Early training: Focus on diversity and pattern breaking
-                loss_vec = torch.stack(
-                    [
-                        loss * 0.3,
-                        hidden_loss * 0.1,
-                        hidden_reliance * 0.1,
-                        diversity_loss_val * 0.3,
-                        entropy_loss * 0.2,
-                        pattern_loss * 0.1,
-                    ]
-                )
-            elif epoch < num_epochs // 2:
-                # Mid training: Balance all losses
-                loss_vec = torch.stack(
-                    [
-                        loss * 0.5,
-                        hidden_loss * 0.15,
-                        hidden_reliance * 0.15,
-                        diversity_loss_val * 0.1,
-                        entropy_loss * 0.05,
-                        pattern_loss * 0.05,
-                    ]
-                )
-            else:
-                # Late training: Focus on accuracy with some diversity
-                loss_vec = torch.stack(
-                    [
-                        loss * 0.7,
-                        hidden_loss * 0.1,
-                        hidden_reliance * 0.1,
-                        diversity_loss_val * 0.05,
-                        entropy_loss * 0.03,
-                        pattern_loss * 0.02,
-                    ]
-                )
-
-            tot_loss = loss_vec.sum()
 
             # Backpropagation with gradient clipping
             tot_loss.backward()
@@ -575,9 +600,6 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
             scheduler.step()
 
             # Stats
-            if hidden_reliance.item() < 0.01:
-                n_hidden_reliant += 1
-            train_hidden_rel_loss += hidden_reliance.item()
             train_loss += tot_loss.item() * len(payload)
             correct = (predictions == payload).sum().item()
             train_acc += correct
@@ -590,12 +612,9 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
                     epoch=epoch,
                     packet_num=i,
                     packet_loss=tot_loss.item(),
-                    loss_vect=loss_vec,
                     packet_acc=correct / len(payload) if len(payload) > 0 else 0,
                     global_train_acc=train_acc / total_bytes,
                     global_train_loss=train_loss / total_bytes,
-                    global_train_hidden_loss=train_hidden_rel_loss / total_bytes,
-                    ratio_hidden_reliant=n_hidden_reliant / (i + 1),
                 )
 
         if total_bytes > 0:
@@ -612,13 +631,11 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         model.eval()
         val_loss = 0.0
         val_acc = 0.0
-        val_hidden_rel_loss = 0.0
         total_val_bytes = 0
-        n_hidden_reliant = 0
 
         with torch.no_grad():
             for i, packet in enumerate(val_loader):
-                cat_features, num_features, payload = [b.to(device) for b in packet]
+                cat_features, num_features, payload = [b.to(DEVICE) for b in packet]
 
                 if len(payload) == 0:
                     continue
@@ -626,32 +643,18 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
                 # Forward pass (no teacher forcing)
                 logits, predictions = model.forward(cat_features, num_features, payload)
 
-                # Compute loss and accuracy
-                loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
-                hidden_reliance = hidden_reliance_loss(
+                tot_loss = combo_loss(
                     model,
                     criterion,
+                    logits,
+                    payload,
+                    predictions,
                     cat_features,
                     num_features,
-                    payload,
-                    loss,
-                    scale=R_HIDDEN_RELIANCE_LOSS_SCALE,
-                    margin=h_loss_margin,
+                    epoch,
+                    num_epochs,
+                    sequence_memory_bank,
                 )
-                val_hidden_rel_loss += hidden_reliance
-                if hidden_reliance == 0:
-                    n_hidden_reliant += 1
-                hidden_loss = compute_hidden_state_regularization(model.hidden)
-
-                # if epoch < num_epochs // 4:
-                #     loss_vec = torch.tensor([0, 0, hidden_reliance], dtype=torch.float32)
-                # else:
-                #     loss_vec = torch.tensor([loss, hidden_loss, hidden_reliance], dtype=torch.float32)
-
-                loss_vec = torch.stack([loss, hidden_loss, hidden_reliance])
-
-                # Assign progressive weighting to the losses
-                tot_loss = loss_vec.dot(loss_weights)
 
                 # Stats
                 val_loss += tot_loss.item() * len(payload)
@@ -667,12 +670,9 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
                         batch_num=i,
                         payload_len=len(payload),
                         payload_loss=tot_loss.item(),
-                        loss_vect=loss_vec,
                         payload_acc=correct / len(payload) if len(payload) > 0 else 0,
                         global_val_acc=val_acc / total_val_bytes,
                         global_val_loss=val_loss / total_val_bytes,
-                        global_val_hidden_loss=val_hidden_rel_loss / total_val_bytes,
-                        ratio_hidden_reliant=n_hidden_reliant / (i + 1),
                     )
 
         if total_val_bytes > 0:
@@ -736,107 +736,380 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         )
 
 
-def packet_it_generator(
-    df_split: List[PacketDataset], epoch_num: int = N_NUM_EPOCHS - 1
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+def train_conversation_level(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """
-    @Description: Creates a batch stream of parsed packets from the given conversations
-
-    @Notes:
-        - We return if the end of a conversation is reached before the full batch lenght is reached
-
-    @Returns: (cat_features_tensor, numerical_features_tensor, payloads_tensor)
-    """
-    # Use the epoch number to schedule how many packets will we will select from each conversation
-    n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
-    print(f"n_conv_packets: {n_conv_packets}")
-    for df in df_split:
-
-        for i, packet in enumerate(df):
-            if i > n_conv_packets:
-                break
-            yield packet.cat_features, packet.numerical_features, torch.tensor(
-                packet.payload
-            )
-
-
-def generate_loaders(csv_dir: str, epoch_num: int = N_NUM_EPOCHS - 1) -> Tuple[
-    PacketIterator,
-    PacketIterator,
-    PacketIterator,
-]:
-    """
-    @Description: Takes a general dataset, splits it into validation and training and then
-    creates loaders for each data split
+    @Description: Conducts loss and training at the conversation level where we assess the model's
+    progression rather than its packet by packet geration ability
 
     @Notes:
 
     @Returns:
     """
-    global conv_list, split_dict
-    train_dfs = list()
-    validation_dfs = list()
-    test_dfs = list()
-
-    train_len = 0
-    validation_len = 0
-    test_len = 0
-
-    cat_dims = list()
-    num_dims = 0
-    # Load the dataset
-    dfs = load_dfs_from_dir(csv_dir=csv_dir)
-    for df in dfs:
-        # Get the conversations splits
-        splits = split_into_conversations(df, conv_list=conv_list)
-
-        print(conv_list)
-        conv_dfs = [
-            PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
-        ]
-
-        train, validation, test = split_convs(conv_dfs).values()
-
-        cat_dims = train[0].cat_dims
-        num_dims = train[0].num_dims
-
-        train_dfs += train
-        validation_dfs += validation
-        test_dfs += test
-
-        for t in train:
-            train_len += len(t)
-
-        for v in validation:
-            validation_len += len(v)
-
-        for ts in test:
-            test_len += len(ts)
-
-    assert isinstance(cat_dims, list), f"The cat dims must be a list of integers"
-    assert isinstance(num_dims, int), f"The num dims must be an integer"
-
-    # Now create batch generators for each
-    return (
-        PacketIterator(
-            packet_it_generator(train_dfs, epoch_num),
-            train_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
-        PacketIterator(
-            packet_it_generator(validation_dfs, epoch_num),
-            validation_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
-        PacketIterator(
-            packet_it_generator(test_dfs, epoch_num),
-            test_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
+    train_loader, val_loader, test_loader = generate_loaders(
+        csv_dir=csv_dir, epoch_num=0
     )
+
+    # Initialize the model
+    model = AdaptivePacketGenerator(
+        train_loader.cat_dims, numerical_dim=train_loader.num_dims
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=N_LR, weight_decay=N_WEIGHT_DECAY
+    )
+    criterion = LabelSmoothingCrossEntropy(
+        smoothing=N_SMOOTHING
+    )  # Label smoothing for robustness
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=N_MAX_LR,
+        total_steps=num_epochs * len(train_loader),
+        pct_start=0.1,
+    )
+
+    model.to(DEVICE)
+
+    # Metrics #
+    best_val_loss = float("inf")
+    train_losses = list()
+    train_conv_losses = list()
+    val_conv_losses = list()
+    val_losses = list()
+    train_acces = list()
+    val_acces = list()
+
+    model.enable_adaptation()
+
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_acc = 0.0
+        train_conv_loss = 0.0
+        train_micro_convs = 0
+        total_train_bytes = 0
+
+        sequence_memory_bank = dict()
+
+        # Run through the training in micro conversations
+        for i, micro_conv in enumerate(create_micro_conversations(train_loader)):
+            # Reset the model's patterns and memory states
+            model.reset_hidden()
+            model.reset_patterns()
+
+            # Store the loss and acc results
+            losses = list()
+            accs = list()
+            mc_avg_payload_len = 0
+
+            for packet in micro_conv:
+                cat_features, num_features, payload = [b.to(DEVICE) for b in packet]
+
+                if len(payload) == 0:
+                    continue
+
+                # Track sequence frequency for memorization penalty
+                seq_key = str(tuple(payload.cpu().numpy()))
+                sequence_memory_bank[seq_key] = sequence_memory_bank.get(seq_key, 0) + 1
+
+                logits, predictions = model.forward(
+                    categorical=cat_features,
+                    numerical=num_features,
+                    target_payload=payload,
+                )
+
+                tot_loss = combo_loss(
+                    model,
+                    criterion,
+                    logits,
+                    payload,
+                    predictions,
+                    cat_features,
+                    num_features,
+                    epoch,
+                    num_epochs,
+                    sequence_memory_bank,
+                )
+
+                # tot_loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
+
+                losses.append(tot_loss)
+
+                # print(f"Actual: {payload}\nPredictions: {predictions}")
+
+                train_loss += tot_loss.item() * len(payload)
+                correct = (predictions == payload).sum().item()
+                train_acc += correct
+                total_train_bytes += payload.numel()
+                mc_avg_payload_len += payload.numel()
+
+                accs.append(correct / len(payload))
+
+            if len(losses) == 0:
+                continue
+
+            lv = torch.stack(losses)
+            conv_loss = progressive_loss(lv)
+            train_conv_loss += conv_loss.item()
+            train_micro_convs += 1
+
+            # Generate a loss value from the progressive loss vector
+            # lv.backward()
+            conv_loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if DEBUG_MODE and len(losses) > 0:
+                mc_avg_payload_len /= len(losses)
+                print_update(
+                    mode="Train",
+                    epoch=epoch,
+                    batch_num=i,
+                    avg_payload_len=mc_avg_payload_len,
+                    mc_loss=lv.mean(),
+                    payload_acc=np.mean(accs),
+                    conv_loss=conv_loss.item(),
+                    global_train_acc=train_acc / total_train_bytes,
+                    global_train_loss=train_loss / total_train_bytes,
+                )
+
+        if total_train_bytes > 0:
+            train_loss /= total_train_bytes
+            train_acc /= total_train_bytes
+            train_conv_loss /= train_micro_convs
+
+        train_losses.append(train_loss)
+        train_acces.append(train_acc)
+        train_conv_losses.append(train_conv_loss)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_acc = 0.0
+        val_conv_loss = 0.0
+        val_micro_convs = 0
+        total_val_bytes = 0
+
+        sequence_memory_bank = dict()
+
+        # Run through the valing in micro conversations
+        # Set the validation conversation range a little higher
+        for i, micro_conv in enumerate(
+            create_micro_conversations(val_loader, conv_len_rng=(20, 50))
+        ):
+            # Reset the model's patterns and memory states
+            model.reset_hidden()
+            model.reset_patterns()
+
+            # Store the loss and acc results
+            losses = list()
+            accs = list()
+            mc_avg_payload_len = 0
+
+            for packet in micro_conv:
+                cat_features, num_features, payload = [b.to(DEVICE) for b in packet]
+
+                if len(payload) == 0:
+                    continue
+
+                # Track sequence frequency for memorization penalty
+                seq_key = str(tuple(payload.cpu().numpy()))
+                sequence_memory_bank[seq_key] = sequence_memory_bank.get(seq_key, 0) + 1
+
+                logits, predictions = model.forward(
+                    categorical=cat_features,
+                    numerical=num_features,
+                    target_payload=payload,
+                )
+
+                tot_loss = combo_loss(
+                    model,
+                    criterion,
+                    logits,
+                    payload,
+                    predictions,
+                    cat_features,
+                    num_features,
+                    epoch,
+                    num_epochs,
+                    sequence_memory_bank,
+                )
+
+                # tot_loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
+
+                losses.append(tot_loss)
+                val_loss += tot_loss.item() * payload.numel()
+                correct = (predictions == payload).sum().item()
+                val_acc += correct
+                total_val_bytes += payload.numel()
+                mc_avg_payload_len += payload.numel()
+                accs.append(correct / payload.numel())
+
+                if DEBUG_MODE:
+                    print(f"Actual: {payload}\nPredictions: {predictions}")
+                    print_update(
+                        mode="Validation packet",
+                        val_loss=val_loss / total_val_bytes,
+                        val_acc=val_acc / total_val_bytes,
+                        pkg_loss=tot_loss.item(),
+                        pkg_acc=correct / payload.numel(),
+                    )
+
+            lv = torch.stack(losses)
+            conv_loss = progressive_loss(lv)
+            val_conv_loss += conv_loss.item()
+            val_micro_convs += 1
+
+            if DEBUG_MODE and len(losses) > 0:
+                mc_avg_payload_len /= len(losses)
+                print_update(
+                    mode="val",
+                    epoch=epoch,
+                    batch_num=i,
+                    avg_payload_len=mc_avg_payload_len,
+                    mc_loss=lv.mean(),
+                    conv_loss=conv_loss.item(),
+                    payload_acc=np.mean(accs),
+                    global_val_acc=val_acc / total_val_bytes,
+                    global_val_loss=val_loss / total_val_bytes,
+                )
+
+        if total_val_bytes > 0:
+            val_loss /= total_val_bytes
+            val_acc /= total_val_bytes
+            val_conv_loss /= val_micro_convs
+
+        val_losses.append(val_loss)
+        val_acces.append(val_acc)
+        val_conv_losses.append(val_conv_loss)
+
+        # Regenerate the loaders for the next epoch
+        train_loader, val_loader, test_loader = generate_loaders(
+            csv_dir=csv_dir, epoch_num=epoch + 1
+        )
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+        # plot the losses and accuracies
+        # if DEBUG_MODE and epoch > num_epochs // 2:
+        #     plot_metrics(
+        #         train_losses,
+        #         f"Training loss for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch Loss",
+        #     )
+        #     plot_metrics(
+        #         train_conv_losses,
+        #         f"Conversation training loss for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch Conv Loss",
+        #     )
+        #     plot_metrics(
+        #         train_acces,
+        #         f"Training acc for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch acc",
+        #     )
+        #     plot_metrics(
+        #         val_losses,
+        #         f"Validation loss for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch Loss",
+        #     )
+        #     plot_metrics(
+        #         val_conv_losses,
+        #         f"Conversation validation loss for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch Conv Loss",
+        #     )
+        #     plot_metrics(
+        #         val_acces,
+        #         f"Validation acc for {epoch}",
+        #         x_label="Epochs",
+        #         y_label="Epoch acc",
+        #     )
+
+
+def combo_loss(
+    model: nn.Module,
+    criterion,
+    logits: torch.Tensor,
+    payload: torch.Tensor,
+    predictions: torch.Tensor,
+    cat_features: torch.Tensor,
+    num_features: torch.Tensor,
+    epoch: int,
+    num_epochs: int,
+    sequence_memory_bank: dict,
+):
+    h_loss_margin = min(0.5, 0.1 + 0.4 * epoch / num_epochs)
+    # Compute primary loss
+    loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
+
+    # Hidden reliance loss
+    hidden_reliance = hidden_reliance_loss(
+        model,
+        criterion,
+        cat_features,
+        num_features,
+        payload,
+        loss,
+        scale=R_HIDDEN_RELIANCE_LOSS_SCALE,
+        margin=h_loss_margin,
+    )
+
+    # Hidden state regularization
+    hidden_loss = compute_hidden_state_regularization(model.hidden)
+
+    # New diversity and pattern breaking losses
+    diversity_loss_val = diversity_loss(predictions, window_size=5)
+    entropy_loss = entropy_regularization(logits, target_entropy=3.0)
+
+    # Sequence memorization penalty - heavily penalize repeated sequences
+    memorization_loss = sequence_memorization_loss(
+        predictions, payload, sequence_memory_bank
+    )
+
+    # Progressive loss weighting with emphasis on breaking memorization early
+    if epoch < num_epochs // 4:
+        # Early training: HEAVY focus on breaking memorization and encouraging diversity
+        loss_vec = torch.stack(
+            [
+                loss * 0.2,  # Reduced primary loss weight
+                hidden_loss * 0.1,
+                hidden_reliance * 0.2,  # Increased hidden reliance
+                diversity_loss_val * 0.25,  # High diversity emphasis
+                entropy_loss * 0.15,
+                memorization_loss * 0.1,  # Memorization penalty
+            ]
+        )
+    elif epoch < num_epochs // 2:
+        # Mid training: Balance memorization prevention with learning
+        loss_vec = torch.stack(
+            [
+                loss * 0.4,
+                hidden_loss * 0.15,
+                hidden_reliance * 0.2,
+                diversity_loss_val * 0.15,
+                entropy_loss * 0.05,
+                memorization_loss * 0.05,
+            ]
+        )
+    else:
+        # Late training: Focus on accuracy but maintain some diversity
+        loss_vec = torch.stack(
+            [
+                loss * 0.65,
+                hidden_loss * 0.1,
+                hidden_reliance * 0.15,
+                diversity_loss_val * 0.05,
+                entropy_loss * 0.03,
+                memorization_loss * 0.02,
+            ]
+        )
+
+    return loss_vec.sum()
 
 
 if __name__ == "__main__":
@@ -847,4 +1120,5 @@ if __name__ == "__main__":
     #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
     # )
 
-    train_model(csv_dir=csv_dir)
+    # train_model(csv_dir=csv_dir)
+    train_conversation_level(csv_dir=csv_dir)

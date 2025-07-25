@@ -15,12 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
-from typing import List, Dict, Tuple, Iterator
+from typing import List, Dict, Tuple, Iterator, Optional
 from dataclasses import dataclass
 
 ### Local imports ###
 from modules.CONSTANTS import *
 from modules.custom_datasets import PacketDataset
+from modules.preprocessing import load_df, split_into_conversations, load_dfs_from_dir
 
 
 ### Custom data classes ###
@@ -178,6 +179,164 @@ def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]
                 ret[key].append(conv_df)
 
     return ret
+
+
+def create_micro_conversations(
+    packet_loader: PacketIterator,
+    conv_len_rng: Tuple[int, int] = (MIN_MICRO_CONV_LEN, MAX_MICRO_CONV_LEN),
+) -> Iterator[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    """
+    @Description: Splits a packet iterator into many different sub conversations
+
+    @Notes:
+        - A generic packet loader draws no distinctions between conversation boundaries.
+
+    @Returns: Iterator of PacketIterator each representing a micro conversation (chatter)
+    """
+    assert (
+        conv_len_rng[0] <= conv_len_rng[1]
+    ), f"The conversation length range lb must be less than ub {conv_len_rng}"
+    last_conv_num = None
+    micro_conv = list()
+
+    for packet in packet_loader:
+        if len(packet[2]) == 0:
+            continue
+
+        cur_conv_num = packet[0][3]  # Conversation number
+
+        if last_conv_num != cur_conv_num:
+            if len(micro_conv) >= conv_len_rng[0]:
+                yield micro_conv
+
+            micro_conv = list()
+
+        elif len(micro_conv) >= conv_len_rng[1]:
+            yield micro_conv
+            micro_conv = list()
+
+        elif len(micro_conv) >= conv_len_rng[0]:
+            if random.random() < MICRO_CONV_YIELD_PROB:
+                yield micro_conv
+                micro_conv = list()
+
+        last_conv_num = cur_conv_num
+
+        micro_conv.append(packet)
+
+
+class PacketItGenerator:
+    def __init__(self, csv_dir: str):
+        self.csv_dir = csv_dir
+        self.n_conv_packets = N_MAX_CONV_PACKETS
+        self.cur_packet_n = 0
+
+    def update_n_packets(self, epoch_num: int = N_NUM_EPOCHS - 1):
+        self.n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
+
+    def packet_it_generator(
+        self, df_split: List[PacketDataset]
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        @Description: Creates a batch stream of parsed packets from the given conversations
+
+        @Notes:
+            - We return if the end of a conversation is reached before the full batch lenght is reached
+
+        @Returns: (cat_features_tensor, numerical_features_tensor, payloads_tensor)
+        """
+        # Use the epoch number to schedule how many packets will we will select from each conversation
+        for df in df_split:
+            for i, packet in enumerate(df):
+                if i > self.n_conv_packets:
+                    break
+                self.cur_packet_n = i
+                yield packet.cat_features, packet.numerical_features, torch.tensor(
+                    packet.payload
+                )
+
+    def generate_loaders(
+        self, csv_dir: str, epoch_num: int | None = None
+    ) -> Tuple[
+        PacketIterator,
+        PacketIterator,
+        PacketIterator,
+    ]:
+        """
+        @Description: Takes a general dataset, splits it into validation and training and then
+        creates loaders for each data split
+
+        @Notes:
+
+        @Returns:
+        """
+        global conv_list, split_dict
+        train_dfs = list()
+        validation_dfs = list()
+        test_dfs = list()
+
+        if epoch_num is not None:
+            self.update_n_packets(epoch_num=epoch_num)
+
+        train_len = 0
+        validation_len = 0
+        test_len = 0
+
+        cat_dims = list()
+        num_dims = 0
+        # Load the dataset
+        dfs = load_dfs_from_dir(csv_dir=csv_dir)
+        for df in dfs:
+            # Get the conversations splits
+            splits = split_into_conversations(df, conv_list=conv_list)
+
+            print(conv_list)
+            conv_dfs = [
+                PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
+            ]
+
+            train, validation, test = split_convs(conv_dfs).values()
+
+            cat_dims = train[0].cat_dims
+            num_dims = train[0].num_dims
+
+            train_dfs += train
+            validation_dfs += validation
+            test_dfs += test
+
+            for t in train:
+                train_len += len(t)
+
+            for v in validation:
+                validation_len += len(v)
+
+            for ts in test:
+                test_len += len(ts)
+
+        assert isinstance(cat_dims, list), f"The cat dims must be a list of integers"
+        assert isinstance(num_dims, int), f"The num dims must be an integer"
+
+        # Now create batch generators for each
+        return (
+            PacketIterator(
+                self.packet_it_generator(train_dfs),
+                train_len,
+                cat_dims=cat_dims,
+                num_dims=num_dims,
+            ),
+            PacketIterator(
+                self.packet_it_generator(validation_dfs),
+                validation_len,
+                cat_dims=cat_dims,
+                num_dims=num_dims,
+            ),
+            PacketIterator(
+                self.packet_it_generator(test_dfs),
+                test_len,
+                cat_dims=cat_dims,
+                num_dims=num_dims,
+            ),
+        )
 
 
 ### Custom loss functions ###
@@ -338,3 +497,152 @@ def pattern_break_loss(hidden_states: List[torch.Tensor]) -> torch.Tensor:
             count += 1
 
     return loss / max(1, count)
+
+
+def sequence_memorization_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    memory_bank: Optional[Dict[str, int]] = None,
+) -> torch.Tensor:
+    """
+    @Description: Takes the dictionary of the past n most frequent sequences, checks if the current
+    prediction is identical and invokes a punishment if that is the case.
+
+    @Notes:
+        - Currently in this loss function there is no reward for getting the entire sequence correct
+        Since we are using an ensamble of loss functions, the others will yield reward for a correct
+        predition. This is simply intended to generalize
+
+    @Returns:
+    """
+    if memory_bank is None:
+        return torch.tensor(0.0, device=predictions.device)
+
+    # Convert predictions to string key for lookup
+    pred_seq = tuple(predictions.cpu().numpy())
+    target_seq = tuple(targets.cpu().numpy())
+
+    # Penalize if this exact sequence has been seen many times
+    seq_key = str(pred_seq)
+    frequency = memory_bank.get(seq_key, 0)
+
+    # Higher penalty for more frequent sequences
+    if frequency > 2:  # If seen more than 2 times
+        penalty = torch.tensor(float(frequency - 2) * 0.1, device=predictions.device)
+        return penalty
+
+    return torch.tensor(0.0, device=predictions.device)
+
+
+def apply_sequence_augmentation(
+    payload: torch.Tensor, epoch: int, total_epochs: int
+) -> torch.Tensor:
+    """
+    @Description:
+
+    @Notes:
+
+    @Returns:
+    """
+
+    # If the sequence is too short, don't purturb it any more
+    if len(payload) <= R_MIN_KEEP_LENGTH:
+        return payload
+
+    augmented = payload.clone()
+
+    # Progressive augmentation - more aggressive early in training
+    aug_intensity = max(0.1, 1.0 - (epoch / total_epochs))
+
+    # 1. Random byte dropping this actually shortens the sequence
+    # TBD! Since the sequence length is something provided in the meta data, we would like to
+    # keep the lengths the same. Masking provides a similar result without the nasty side effects
+    # if random.random() < R_SEQUENCE_DROP_PROB * aug_intensity:
+    #     max_drop = min(
+    #         int(len(payload) * R_MAX_DROP_RATIO), len(payload) - R_MIN_KEEP_LENGTH
+    #     )
+    #     if max_drop > 0:
+    #         n_drop = random.randint(1, max_drop)
+    #         drop_indices = random.sample(range(len(payload)), n_drop)
+    #         # Create mask and remove dropped indices
+    #         mask = torch.ones(len(payload), dtype=torch.bool)
+    #         mask[drop_indices] = False
+    #         augmented = augmented[mask]
+
+    # 2. Random subsequence shuffling
+    if random.random() < R_SEQUENCE_SHUFFLE_PROB * aug_intensity and len(augmented) > 4:
+        # Shuffle small chunks to break local patterns
+        chunk_size = random.randint(2, min(4, len(augmented) // 2))
+        start_idx = random.randint(0, len(augmented) - chunk_size)
+        chunk = augmented[start_idx : start_idx + chunk_size].clone()
+        # Shuffle within chunk
+        shuffle_idx = torch.randperm(chunk_size)
+        augmented[start_idx : start_idx + chunk_size] = chunk[shuffle_idx]
+
+    # 3. Random masking of bytes
+    if random.random() < R_SEQUENCE_MASK_PROB * aug_intensity:
+        n_mask = random.randint(1, min(3, len(augmented)))
+        mask_indices = random.sample(range(len(augmented)), n_mask)
+        for idx in mask_indices:
+            augmented[idx] = MASK
+
+    return augmented
+
+
+def progressive_loss(loss_vector: torch.Tensor) -> torch.Tensor:
+    """
+    @Description: Generates a loss value from how our loss vector progresses.
+    Ideally we would like to see the conversation loss begin high because the memory is not yet
+    established and undergo exponential decay as we add packets
+
+    @Notes:
+        - L = max_l + (start_l - end_l) * dx
+        - All operations preserve gradients
+        - Only max, first, and last losses get gradients
+
+    @Returns: Scalar loss with gradients connected to model
+    """
+    if len(loss_vector) == 0:
+        return torch.tensor(0.0, device=loss_vector.device, requires_grad=True)
+
+    if len(loss_vector) == 1:
+        return loss_vector[0]
+
+    # All these operations preserve gradients
+    max_loss = loss_vector.max()
+    improvement = loss_vector[0] - loss_vector[-1]
+    sequence_length = float(
+        loss_vector.numel()
+    )  # Convert to float, no gradients needed
+
+    return torch.sigmoid((max_loss + improvement * sequence_length) / 10) * 10
+
+
+def conversation_trajectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
+    """
+    Alternative: Focus on the entire trajectory shape
+    This gives gradients to ALL elements in the loss vector
+    """
+    if len(loss_vector) <= 1:
+        return (
+            loss_vector[0]
+            if len(loss_vector) == 1
+            else torch.tensor(0.0, device=loss_vector.device)
+        )
+
+    # Ideal trajectory: exponential decay
+    # Create target trajectory
+    n_steps = len(loss_vector)
+    x = torch.arange(n_steps, dtype=torch.float32, device=loss_vector.device)
+
+    # Target: start high, decay exponentially
+    initial_loss = loss_vector[0].detach()  # Use actual first loss as target start
+    target_decay = initial_loss * torch.exp(-x * 0.5)  # Exponential decay
+
+    # MSE between actual trajectory and ideal trajectory
+    trajectory_loss = F.mse_loss(loss_vector, target_decay)
+
+    # Also add improvement term
+    improvement = loss_vector[0] - loss_vector[-1]
+
+    return trajectory_loss - 0.1 * improvement  # Reward improvement

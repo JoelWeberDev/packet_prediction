@@ -243,7 +243,7 @@ O_MD_HIDDEN_DIM = 64
 
 # Packet representation size
 O_PACKET_REP_DIM = 128
-O_PACKET_EMB_LAYERS = 1
+O_PACKET_EMB_LAYERS = 2
 O_PACKET_EMB_DROPOUT = 0.1
 
 # Training parameters

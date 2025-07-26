@@ -32,7 +32,7 @@ from icecream import ic
 
 # Local imports
 from modules.CONSTANTS import *
-from modules.preprocessing import extract_features, split_into_conversations
+from modules.preprocessing import extract_features
 
 
 ### Custom data structures ###
@@ -46,6 +46,7 @@ class ParsedPacket:
     numerical_names: list
     numerical_features: torch.Tensor
 
+    ### Generics ###
     def __str__(self):
 
         ret = f"cat_features: {[f'{name}: {value}' for name, value in zip(self.cat_names, self.cat_features.tolist())]}\n"
@@ -355,20 +356,12 @@ class ByteStream(Dataset):
 
 if __name__ == "__main__":
     from preprocessing import load_df
+    from helper_functions import PacketItGenerator
 
+    csv_dir = "test_data"
+    packet_generator = PacketItGenerator(csv_dir=csv_dir)
     # Get the packet data set
     df = load_df()
 
     conv_list = list()
-    conv_dfs = split_into_conversations(df, conv_list=conv_list)
-
-    def test_packet_dataset(df: pd.DataFrame):
-        ds = PacketDataset(df, 1)
-
-        pkg = next(ds)
-
-        print(pkg.target)
-
-    for conv_df in conv_dfs:
-        print(len(conv_df))
-        test_packet_dataset(conv_df)
+    conv_dfs = PacketItGenerator.split_into_conversations(df, conv_list=conv_list)

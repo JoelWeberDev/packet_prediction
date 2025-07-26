@@ -34,7 +34,8 @@ micro model rather than themselves memorizing the training data.
 import torch
 import torch.nn as nn
 from typing import List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from copy import deepcopy
 
 ### Local imports ###
 from modules.CONSTANTS import *
@@ -53,6 +54,61 @@ from modules.helper_functions import (
 class PacketPrediction:
     logits: torch.Tensor
     preds: torch.Tensor
+
+
+@dataclass
+class ConvResults:
+    packet_losses: List[torch.Tensor]
+    packet_accs: List[int]
+
+
+@dataclass
+class EpochResults:
+    tot_loss: float = 0.0
+    tot_acc: float = 0.0
+    tot_conv_loss: float = 0
+    n_packets: int = 0
+    n_convs: int = 0
+
+    ### Getters ###
+    @property
+    def avg_loss(self):
+        return self.tot_loss / self.n_packets if self.n_packets > 0 else float("inf")
+
+    @property
+    def avg_acc(self):
+        return self.tot_acc / self.n_packets if self.n_packets > 0 else float("inf")
+
+    @property
+    def avg_conv_loss(self):
+        return self.tot_conv_loss / self.n_convs if self.n_convs > 0 else float("inf")
+
+    ### Generics ###
+    def __len__(self):
+        return self.n_packets
+
+    def __str__(self):
+        return f"""
+            avg loss: {self.avg_loss}
+            avg acc: {self.avg_acc}
+            avg conv loss: {self.avg_conv_loss}
+            num packets: {self.n_packets}
+            num convs: {self.n_convs}
+        """
+
+
+@dataclass
+class ModelMetrics:
+    loss: List[float] = field(default_factory=list)
+    acc: List[float] = field(default_factory=list)
+
+    @property
+    def avg_loss(self):
+        return np.mean(self.avg_loss) if len(self.loss) > 0 else float("inf")
+
+    @property
+    def avg_acc(self):
+        return np.mean(self.avg_acc) if len(self.acc) > 0 else float("inf")
 
 
 class MetadataEmbedder(nn.Module):
@@ -95,6 +151,8 @@ class MetadataEmbedder(nn.Module):
         )  # Inference Frozen
 
     def get_embeddings(self, cat_f: torch.Tensor, num_f: torch.Tensor) -> torch.Tensor:
+        cat_f = cat_f.to(device=DEVICE)
+        num_f = num_f.to(device=DEVICE)
         # Embed categorical features
         cat_embeds = [embed(cat_f[i]) for i, embed in enumerate(self.cat_embeddings)]
         cat_concat = torch.cat(cat_embeds, dim=0)
@@ -271,7 +329,9 @@ class OnlinePacketPredictor(nn.Module):
             byte_ctx = ctx_payload[i : i + O_BYTE_CTX_LEN].flatten()
 
             # Generate the lstm input
-            lstm_input = torch.cat([packet_ctx_emb, metadata_emb, byte_ctx], dim=-1)
+            lstm_input = torch.cat(
+                [packet_ctx_emb, metadata_emb, byte_ctx], dim=-1
+            ).unsqueeze(0)
 
             output, self.hidden = self.micro_byte_gru(
                 lstm_input, self.hidden.detach() if self.hidden is not None else None
@@ -286,31 +346,42 @@ class OnlinePacketPredictor(nn.Module):
 
         return PacketPrediction(logits=res_logits, preds=preds)
 
-    ### Overloads ###
-    def eval(self):
-        # Freeze training on all the components except the intenral micro model
-        self.train_mode_micro_only()
-
-        return self
-
     ### Helper functions ###
     def train_mode_support_only(self):
         """Set only support components to training mode"""
+        self.eval()
+
         self.metadata_embedder.train()
         self.byte_embedder.train()
         self.packet_embedder.train()
 
-        self.micro_byte_gru.eval()
-        self.output_projection.eval()
+        for name, param in self.named_parameters():
+            if any(
+                component in name
+                for component in [
+                    "metadata_embedder",
+                    "byte_embedder",
+                    "packet_embedder",
+                ]
+            ):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     def train_mode_micro_only(self):
         """Set only micro components to training mode"""
-        self.metadata_embedder.eval()
-        self.byte_embedder.eval()
-        self.packet_embedder.eval()
-
+        self.eval()
         self.micro_byte_gru.train()
         self.output_projection.train()
+
+        for name, param in self.named_parameters():
+            if any(
+                component in name
+                for component in ["micro_byte_gru", "output_projection"]
+            ):
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     def conv_reset(self):
         self.hidden = None
@@ -319,30 +390,153 @@ class OnlinePacketPredictor(nn.Module):
 
 
 ### Training and analysis functions ###
-### Helper functions ###
+def run_conv(
+    model: OnlinePacketPredictor,
+    optimizer,
+    criterion,
+    conv_df: PacketDataset,
+    max_conv_len: float,
+    train: bool = False,
+) -> ConvResults:
+    # prep to train again
+    model.conv_reset()
+    model.train_mode_micro_only()
+    packet_ctx = list()
+    packet_losses = list()
+    packet_accs = list()
+    conv_packet_cnt = 0
+
+    # Storge of micro gru states for creating separate comp graph
+    packet_data = list()
+    micro_gru_states = list()
+    output_proj_states = list()
+
+    # Iterate through the conversation
+    for packet in conv_df:
+        if len(packet.payload) == 0:
+            continue
+
+        packet_data.append(packet)
+
+        if len(packet_ctx) == O_PACKET_CTX_LEN:
+            target_payload = torch.tensor(
+                packet.payload, dtype=torch.long, device=DEVICE
+            )
+
+            # Preserve the states of our conversation components before doing anything to them
+            optimizer.zero_grad()
+            micro_gru_states.append(model.micro_byte_gru.state_dict())
+            output_proj_states.append(model.output_projection.state_dict())
+
+            results = model.forward(packet_ctx, packet)
+            logits = results.logits
+            preds = results.preds
+
+            # Get the loss
+            packet_train_loss = criterion.forward(
+                logits.view(-1, VOCAB_DIM), target_payload.view(-1)
+            )
+            conv_train_loss = criterion.forward(
+                logits.view(-1, VOCAB_DIM), target_payload.view(-1)
+            )
+
+            # Only attach losses from this part if model is not training
+            if not train:
+                packet_losses.append(conv_train_loss)
+
+            # Backprop to the micro gru
+            packet_train_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            optimizer.zero_grad()
+
+            # Get the accuracy
+            correct = (preds == target_payload).sum().item()
+            packet_accs.append(correct / len(packet.payload))
+
+            conv_packet_cnt += 1
+
+            if len(packet_losses) >= max_conv_len:
+                break
+
+        packet_ctx.append(packet)
+        packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
+
+    if train:
+        model.conv_reset()
+        packet_ctx = list()
+        state_index = 0
+
+        for packet in packet_data:
+            if len(packet_ctx) == O_PACKET_CTX_LEN:
+                target_payload = torch.tensor(
+                    packet.payload, dtype=torch.long, device=DEVICE
+                )
+                # Load the model state dictionary
+                model.micro_byte_gru.load_state_dict(micro_gru_states[state_index])
+                model.output_projection.load_state_dict(output_proj_states[state_index])
+
+                with torch.no_grad():
+                    # Freeze micro components for this forward pass
+                    for param in model.micro_byte_gru.parameters():
+                        param.requires_grad = False
+                    for param in model.output_projection.parameters():
+                        param.requires_grad = False
+
+                # Re-enable gradients for support components
+                for name, param in model.named_parameters():
+                    if any(
+                        component in name
+                        for component in [
+                            "metadata_embedder",
+                            "byte_embedder",
+                            "packet_embedder",
+                        ]
+                    ):
+                        param.requires_grad = True
+
+                # Run a full forward pass
+                results = model.forward(packet_ctx, packet)
+
+                loss = criterion.forward(
+                    results.logits.view(-1, VOCAB_DIM), target_payload
+                )
+
+                packet_losses.append(loss)
+
+                state_index += 1
+
+            packet_ctx.append(packet)
+            packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
+
+    return ConvResults(packet_losses, packet_accs)
+
+
 def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
     packet_generator = PacketItGenerator(csv_dir)
-    train_convs, validation_convs, testing_convs = (
-        packet_generator.generate_conv_loaders(csv_dir)
-    )
+    data_split_dict = packet_generator.generate_conv_loaders(csv_dir)
 
     # Initialize the model
     metadata_embeder = MetadataEmbedder(
-        train_convs[0].cat_dims, train_convs[0].num_dims
+        data_split_dict["train"][0].cat_dims, data_split_dict["train"][0].num_dims
     )
     model = OnlinePacketPredictor(metadata_embedder=metadata_embeder)
 
-    optimizer = torch.optim.AdamW(
+    packet_optimizer = torch.optim.AdamW(
+        model.parameters(), lr=O_LR, weight_decay=O_WEIGHT_DECAY
+    )
+    train_optimizer = torch.optim.AdamW(
         model.parameters(), lr=O_LR, weight_decay=O_WEIGHT_DECAY
     )
     criterion = LabelSmoothingCrossEntropy(
         smoothing=O_SMOOTHING
     )  # Label smoothing for robustness
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
+        train_optimizer,
         max_lr=O_MAX_LR,
-        total_steps=num_epochs * len(train_loader),
+        total_steps=num_epochs * len(data_split_dict["train"]),
         pct_start=0.1,
     )
 
@@ -350,18 +544,13 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     model.to(device)
 
     # Metrics #
-    train_losses = list()
-    val_losses = list()
-    train_acces = list()
+    model_metrics = dict()
+    for mode in data_split_dict.keys():
+        model_metrics[mode] = ModelMetrics()
 
     for epoch in range(num_epochs):
         # Training phase
         model.train_mode_support_only()
-        epoch_train_loss = 0.0
-        epoch_train_acc = 0.0
-        epoch_packet_cnt = 0
-        epoch_train_conv_loss = 0.0
-        n_convs = 0
         packet_generator.n_conv_packets = (
             N_MAX_CONV_PACKETS  # Permit the max number of conv packets
         )
@@ -373,120 +562,92 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         )  # TBD! should I add NL scheduling?
         model.temperature = temperature
 
-        for conv_df in train_convs:
-            # prep to train again
-            model.conv_reset()
-            model.train_mode_micro_only()
-            packet_ctx = list()
-            packet_losses = list()
-            packet_accs = list()
-            conv_packet_cnt = 0
+        epoch_results = dict()
 
-            # Iterate through the conversation
-            for packet in conv_df:
-                if len(packet_ctx) == O_PACKET_CTX_LEN and len(packet.payload) > 0:
-                    target_payload = torch.tensor(packet.payload, dtype=torch.long)
-                    results = model.forward(packet_ctx, packet)
-                    logits = results.logits
-                    preds = results.preds
+        for mode, conv_dfs in data_split_dict.items():
+            mode_results = EpochResults()
+            epoch_results[mode] = mode_results
 
-                    # Get the loss
-                    loss = criterion.forward(
-                        logits.view(-1, VOCAB_DIM), target_payload.view(-1)
-                    )
-                    packet_losses.append(loss)
+            for conv_df in conv_dfs:
+                # Assess the model's preformance
+                # The model's preformance will improve based on how much difference the GRU's updates help
+                conv_results = run_conv(
+                    model,
+                    packet_optimizer,
+                    criterion,
+                    conv_df,
+                    max_conv_len,
+                    train=(mode == "train"),
+                )
+                packet_losses = conv_results.packet_losses
+                packet_accs = conv_results.packet_accs
 
-                    # Backprop to the micro gru
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-
-                    # Get the accuracy
-                    correct = (preds == target_payload).sum().item()
-                    packet_accs.append(correct / len(packet.payload))
-
-                    conv_packet_cnt += 1
-
-                    if conv_packet_cnt == max_conv_len:
-                        break
-
-                packet_ctx.append(packet)
-                packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
-
-            # Assess the model's preformance
-            model.train_mode_support_only()
-            # The model's preformance will improve based on how much difference the GRU's updates help
-
-            if len(packet_losses) > 0:
-                # TBD!! what is a good loss function for this issue?
-                conv_loss = conversation_tradjectory_loss(torch.stack(packet_losses))
-                epoch_train_conv_loss += conv_loss.item()
-                n_convs += 1
-                epoch_packet_cnt += conv_packet_cnt
-
-                loss_mean = np.mean(packet_losses)
-                acc_mean = np.mean(packet_accs)
-                epoch_train_loss += loss_mean
-                epoch_train_acc += acc_mean
-
-                # Loss and feedback stuff
-                conv_loss.backward()
-                optimizer.step()
-                scheduler.step()
-
-                # Print results
-                if DEBUG_MODE:
-                    print_update(
-                        epoch_number=epoch,
-                        epoch_loss=epoch_train_loss / epoch_packet_cnt,
-                        epoch_acc=epoch_train_acc / epoch_packet_cnt,
-                        packet_loss_mean=loss_mean,
-                        packet_acc_mean=acc_mean,
-                        n_packets=conv_packet_cnt,
-                        conv_packet_loss=conv_loss.item(),
+                if len(packet_losses) > 0:
+                    # Compute the losses from the raw logits
+                    # TBD!! what is a good loss function for this issue?
+                    conv_loss = conversation_tradjectory_loss(
+                        torch.stack(packet_losses)
                     )
 
-        if epoch_packet_cnt > 0:
-            epoch_train_loss /= epoch_packet_cnt
-            epoch_train_acc /= epoch_packet_cnt
-        else:
-            epoch_train_loss = float("inf")
-            epoch_train_acc = float("inf")
+                    # Loss and feedback stuff
+                    if mode == "train":
+                        train_optimizer.zero_grad()
+                        model.train_mode_support_only()
+                        conv_loss.backward()
+                        train_optimizer.step()
+                        scheduler.step()
 
-        train_losses.append(epoch_train_loss)
-        train_acces.append(epoch_train_acc)
+                    mode_results.tot_conv_loss += conv_loss.item()
+                    mode_results.n_convs += 1
+                    mode_results.n_packets += len(packet_losses)
+
+                    loss_mean = float(np.mean([loss.item() for loss in packet_losses]))
+                    acc_mean = float(np.mean(packet_accs))
+                    mode_results.tot_loss += loss_mean
+                    mode_results.tot_acc += acc_mean
+
+                    # Print results
+                    if DEBUG_MODE:
+                        print_update(
+                            mode=mode,
+                            epoch_number=epoch,
+                            packet_loss_mean=loss_mean,
+                            packet_acc_mean=acc_mean,
+                            conv_packet_loss=conv_loss.item(),
+                            epoch_mode_results=str(mode_results),
+                        )
+
+            epoch_results[mode] = mode_results
+
+            model_metrics[mode].loss.append(mode_results.avg_loss)
+            model_metrics[mode].acc.append(mode_results.avg_acc)
 
         # plot the losses and accuracies
         if DEBUG_MODE and epoch > num_epochs // 2:
-            plot_metrics(
-                train_losses,
-                f"Training loss for {epoch}",
-                x_label="Epochs",
-                y_label="Epoch Loss",
-            )
-            plot_metrics(
-                val_losses,
-                f"Validation loss for {epoch}",
-                x_label="Epochs",
-                y_label="Epoch Loss",
-            )
-            plot_metrics(
-                train_acces,
-                f"Training acc for {epoch}",
-                x_label="Epochs",
-                y_label="Epoch acc",
-            )
+            for key, metrics in model_metrics.items():
+                plot_metrics(
+                    metrics.avg_loss,
+                    f"{key} loss for {epoch}",
+                    x_label="Epochs",
+                    y_label="Epoch Loss",
+                )
+                plot_metrics(
+                    metrics.avg_acc,
+                    f"{key} acc for {epoch}",
+                    x_label="Epochs",
+                    y_label="Epoch acc",
+                )
 
         # Regenerate the loaders for the next epoch
-        train_loader, _, _ = packet_generator.generate_loaders(
-            csv_dir=csv_dir, epoch_num=epoch + 1
-        )
+        data_split_dict = packet_generator.generate_conv_loaders(csv_dir)
 
 
 if __name__ == "__main__":
 
     csv_dir = "test_data"
-    csv_dir = "/home/joel/Documents/laurier/URSA/research/datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    csv_dir = (
+        "../datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    )
     # csv_dir = (
     #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
     # )

@@ -185,11 +185,11 @@ class PacketItGenerator:
         self.n_conv_packets = N_MAX_CONV_PACKETS
         self.cur_packet_n = 0
         self.conv_list = list()
-        self.split_dict = dict()
+        self.split_dict = {"train": [], "val": [], "test": []}
 
     ### Private ###
+    @staticmethod
     def split_into_conversations(
-        self,
         df: pd.DataFrame,
         conv_list: List[Tuple[str, str]],
         add_conv_num: bool = True,
@@ -373,9 +373,7 @@ class PacketItGenerator:
             ),
         )
 
-    def generate_conv_loaders(
-        self, csv_dir: str
-    ) -> Tuple[List[PacketDataset], List[PacketDataset], List[PacketDataset]]:
+    def generate_conv_loaders(self, csv_dir: str) -> Dict[str, List[PacketDataset]]:
         # Load the csv file data frames from the directory
         csv_dfs = load_dfs_from_dir(csv_dir=csv_dir)
 
@@ -392,13 +390,15 @@ class PacketItGenerator:
             ]
 
             # Split the conv dfs into training, validation, and testing
-            s_train, s_validation, s_testing = self.split_convs(conv_dfs=conv_dfs)
+            s_train, s_validation, s_testing = self.split_convs(
+                conv_dfs=conv_dfs
+            ).values()
 
             train += s_train
             validation += s_validation
             testing += s_testing
 
-        return train, validation, testing
+        return {"train": train, "validation": validation}
 
 
 ### Custom loss functions ###

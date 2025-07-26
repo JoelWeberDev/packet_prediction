@@ -227,6 +227,34 @@ R_MIN_KEEP_LENGTH = 3  # Minimum sequence length to keep
 R_MEMORY_PRESSURE_EPOCHS = 8  # Number of epochs to apply memory pressure
 R_FORCE_GENERALIZATION = True  # Whether to force cross-conversation generalization
 
+### Online packet predictor constants ###
+O_HIDDEN_SIZE = 256
+O_NUM_LAYERS = 2
+O_BYTE_EMB_DIM = 32
+O_HIDDEN_DROPOUT = 0.1
+O_PACKET_CTX_LEN = 4
+O_BYTE_CTX_LEN = 32
+O_DROPOUT = 0.2
+
+# Meta data parameters
+O_CAT_MAX_EMB_DIM = 20
+O_MD_DROPOUT = 0.2
+O_MD_HIDDEN_DIM = 64
+
+# Packet representation size
+O_PACKET_REP_DIM = 128
+O_PACKET_EMB_LAYERS = 1
+O_PACKET_EMB_DROPOUT = 0.1
+
+# Training parameters
+O_LR = 1e-3
+O_MAX_LR = 3e-3
+O_WEIGHT_DECAY = 1e-5
+O_SMOOTHING = 0.1
+O_DEFAULT_TEMP = 0.9
+O_MAX_CONV_LEN = 500
+
+### Micro conversation defaults ###
 MIN_MICRO_CONV_LEN = 20
 MAX_MICRO_CONV_LEN = 40
 MICRO_CONV_YIELD_PROB = 0.25

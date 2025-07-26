@@ -29,14 +29,14 @@ from modules.helper_functions import (
     hidden_reliance_loss,
     compute_hidden_state_regularization,
     LabelSmoothingCrossEntropy,
+    PacketItGenerator,
     diversity_loss,
     entropy_regularization,
     sequence_memorization_loss,
     apply_sequence_augmentation,
-    generate_loaders,
     create_micro_conversations,
     progressive_loss,
-    conversation_trajectory_loss,
+    conversation_tradjectory_loss,
 )
 
 
@@ -434,7 +434,8 @@ class AdaptivePacketGenerator(nn.Module):
 ### Training helper functions ###
 def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
-    train_loader, val_loader, test_loader = generate_loaders(
+    packet_loader = PacketItGenerator(csv_dir=csv_dir)
+    train_loader, val_loader, test_loader = packet_loader.generate_loaders(
         csv_dir=csv_dir, epoch_num=0
     )
 

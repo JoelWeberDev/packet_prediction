@@ -12,3 +12,9 @@ from copy import deepcopy
 
 
 print(torch.sigmoid(torch.tensor(-10)))
+
+
+t = torch.tensor(range(10)).tolist()
+
+l = [v for v in t]
+print(np.mean(l))

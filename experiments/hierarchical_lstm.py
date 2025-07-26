@@ -378,7 +378,7 @@ class NextPacketPredictor(nn.Module):
         @TEST:
             - Does this padded sequnce only predict for a single byte? What is the output shape?
 
-        @Returns: List[torch.Tensor]
+        @Returns: Tuple[torch.Tensor]
         """
         # Autoregressively predict the next byte in the packet, adding it to the context each time
         assert len(context.shape) == 1, f"The context tensor must be 1D"
@@ -449,10 +449,16 @@ class HeirarchicalMQTTModel(nn.Module):
 
     def detach_all_hidden(self):
         if self.conversation_lstm.hidden is not None:
-            self.conversation_lstm.hidden = (self.conversation_lstm.hidden[0].detach(), self.conversation_lstm.hidden[1].detach())
+            self.conversation_lstm.hidden = (
+                self.conversation_lstm.hidden[0].detach(),
+                self.conversation_lstm.hidden[1].detach(),
+            )
 
         if self.next_packet_predictor.hidden is not None:
-            self.next_packet_predictor.hidden = (self.next_packet_predictor.hidden[0].detach(), self.next_packet_predictor.hidden[1].detach())
+            self.next_packet_predictor.hidden = (
+                self.next_packet_predictor.hidden[0].detach(),
+                self.next_packet_predictor.hidden[1].detach(),
+            )
 
     def reset_hidden_states(self):
         self.conversation_lstm.hidden = None
@@ -736,8 +742,8 @@ def model_train(csv_dir: str):
     scheduler = None
 
     # Now train over n training epochs
-    for epoch in range(N_EPOCHS):
-        g_cur_temperature = P_INITIAL_TEMPERATURE * (1 - epoch / N_EPOCHS)
+    for epoch in range(N_NUM_EPOCHS):
+        g_cur_temperature = P_INITIAL_TEMPERATURE * (1 - epoch / N_NUM_EPOCHS)
         dfs = load_dfs_from_dir(csv_dir=csv_dir)
         for df in dfs:
             # Get the conversations splits

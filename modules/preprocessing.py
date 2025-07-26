@@ -332,52 +332,6 @@ def load_df(
     return df
 
 
-def split_into_conversations(
-    df: pd.DataFrame,
-    conv_list: List[Tuple[str, str]],
-    add_conv_num: bool = True,
-) -> List[pd.DataFrame]:
-    """
-    @Description: Takes a data frame from the mqtt data and divides it into separate
-    conversations each indexed by a uniqe conversation number. The conv_list is
-    provided to ensure that conversation number uniqueness remains consistent throughout
-    multiplie conversation splits. If starting fresh just pass an empty list.
-
-    @Notes:
-        - The conv_list is modified if there a new conversation is found. Appending to a list
-        passed to a function modifies that list and not just a copy of it.
-
-    """
-    ips = list(col_values_set(df, SRC_IP_TAG).keys())
-
-    convs = list()
-
-    while len(ips) > 1:
-        ip1 = ips.pop()
-
-        for ip2 in ips:
-            conv_df = conversation_filter(df, ip1, ip2).copy()
-            if len(conv_df) > 0:
-                # Search for the conversation in the conv list
-                conv_num = len(conv_list)
-                for i, (c_ip1, c_ip2) in enumerate(conv_list):
-                    if ((c_ip1 == ip1) and (c_ip2 == ip2)) or (
-                        (c_ip1 == ip2) and (c_ip2 == ip1)
-                    ):
-                        conv_num = i
-                        break
-
-                if conv_num == len(conv_list):
-                    conv_list.append((ip1, ip2))
-
-                if add_conv_num:
-                    conv_df["conv.number"] = [conv_num] * len(conv_df)
-
-                convs.append(conv_df)
-
-    return convs
-
-
 def load_dfs_from_dir(csv_dir: str) -> Iterator[pd.DataFrame]:
 
     assert os.path.isdir(

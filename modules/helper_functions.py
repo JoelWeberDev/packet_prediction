@@ -10,6 +10,7 @@
 
 ### Python imports ###
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -20,14 +21,14 @@ from dataclasses import dataclass
 
 ### Local imports ###
 from modules.CONSTANTS import *
-from modules.custom_datasets import PacketDataset
-from modules.preprocessing import load_df, split_into_conversations, load_dfs_from_dir
+from modules.custom_datasets import PacketDataset, ParsedPacket
+from modules.preprocessing import load_dfs_from_dir, conversation_filter, col_values_set
 
 
 ### Custom data classes ###
 @dataclass
 class PacketIterator:
-    packet_it: Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+    packet_it: Iterator[ParsedPacket]
     n_packets: int
     cat_dims: List[int]
     num_dims: int
@@ -134,53 +135,6 @@ def google_get_embedding_dim(n_cats: int) -> int:
     return min(MAX_CAT_EMB, round((n_cats * CAT_EMB_SCALAR) ** CAT_EMB_EXPO))
 
 
-### Cross function variables ###
-conv_list = list()
-split_dict = {
-    "train": [],
-    "val": [],
-    "test": [],
-}
-
-
-### Helper functions ###
-def update_split_dict():
-    global split_dict, conv_list
-    n_convs = len(conv_list)
-    n_in_dict = np.sum([len(elem) for elem in split_dict.values()])
-    # Number of values to add for each category
-    n_train = int(TRAIN_VAL_TEST_PERCS[0] * n_convs) - len(split_dict["train"])
-    n_val = int(TRAIN_VAL_TEST_PERCS[1] * n_convs) - len(split_dict["val"])
-    n_test = n_convs - n_val - n_train - len(split_dict["test"])
-
-    # Now get how many are already in the split dict
-    new_conv_nums = list(range(n_in_dict, n_in_dict + n_train + n_val + n_test))
-    for key, n_nums in zip(split_dict.keys(), (n_train, n_val, n_test)):
-        for _ in range(n_nums):
-            # We randomly choose which category each conversation nubmer should go to
-            conv_num = new_conv_nums.pop(np.random.randint(0, len(new_conv_nums)))
-            split_dict[key].append(conv_num)
-
-    assert (
-        len(new_conv_nums) == 0
-    ), f"Remaining converstion number list length must be 0, not {len(new_conv_nums)}"
-
-
-def split_convs(conv_dfs: List[PacketDataset]) -> Dict[str, List[PacketDataset]]:
-    # update the splti dict
-    update_split_dict()
-
-    ret = {"train": [], "val": [], "test": []}
-    # Now use the indicies to split the conversations into train, validation, and test
-    # We assume that each conv_df has one and only one conversation number
-    for conv_df in conv_dfs:
-        for key, conv_nums in split_dict.items():
-            if conv_df.conv_num in conv_nums:
-                ret[key].append(conv_df)
-
-    return ret
-
-
 def create_micro_conversations(
     packet_loader: PacketIterator,
     conv_len_rng: Tuple[int, int] = (MIN_MICRO_CONV_LEN, MAX_MICRO_CONV_LEN),
@@ -230,13 +184,95 @@ class PacketItGenerator:
         self.csv_dir = csv_dir
         self.n_conv_packets = N_MAX_CONV_PACKETS
         self.cur_packet_n = 0
+        self.conv_list = list()
+        self.split_dict = dict()
 
-    def update_n_packets(self, epoch_num: int = N_NUM_EPOCHS - 1):
-        self.n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
+    ### Private ###
+    def split_into_conversations(
+        self,
+        df: pd.DataFrame,
+        conv_list: List[Tuple[str, str]],
+        add_conv_num: bool = True,
+    ) -> List[pd.DataFrame]:
+        """
+        @Description: Takes a data frame from the mqtt data and divides it into separate
+        conversations each indexed by a uniqe conversation number. The conv_list is
+        provided to ensure that conversation number uniqueness remains consistent throughout
+        multiplie conversation splits. If starting fresh just pass an empty list.
+
+        @Notes:
+            - The conv_list is modified if there a new conversation is found. Appending to a list
+            passed to a function modifies that list and not just a copy of it.
+
+        """
+        ips = list(col_values_set(df, SRC_IP_TAG).keys())
+
+        convs = list()
+
+        while len(ips) > 1:
+            ip1 = ips.pop()
+
+            for ip2 in ips:
+                conv_df = conversation_filter(df, ip1, ip2).copy()
+                if len(conv_df) > 0:
+                    # Search for the conversation in the conv list
+                    conv_num = len(conv_list)
+                    for i, (c_ip1, c_ip2) in enumerate(conv_list):
+                        if ((c_ip1 == ip1) and (c_ip2 == ip2)) or (
+                            (c_ip1 == ip2) and (c_ip2 == ip1)
+                        ):
+                            conv_num = i
+                            break
+
+                    if conv_num == len(conv_list):
+                        conv_list.append((ip1, ip2))
+
+                    if add_conv_num:
+                        conv_df["conv.number"] = [conv_num] * len(conv_df)
+
+                    convs.append(conv_df)
+
+        return convs
+
+    def update_split_dict(self):
+        n_convs = len(self.conv_list)
+        n_in_dict = np.sum([len(elem) for elem in self.split_dict.values()])
+        # Number of values to add for each category
+        n_train = int(TRAIN_VAL_TEST_PERCS[0] * n_convs) - len(self.split_dict["train"])
+        n_val = int(TRAIN_VAL_TEST_PERCS[1] * n_convs) - len(self.split_dict["val"])
+        n_test = n_convs - n_val - n_train - len(self.split_dict["test"])
+
+        # Now get how many are already in the split dict
+        new_conv_nums = list(range(n_in_dict, n_in_dict + n_train + n_val + n_test))
+        for key, n_nums in zip(self.split_dict.keys(), (n_train, n_val, n_test)):
+            for _ in range(n_nums):
+                # We randomly choose which category each conversation nubmer should go to
+                conv_num = new_conv_nums.pop(np.random.randint(0, len(new_conv_nums)))
+                self.split_dict[key].append(conv_num)
+
+        assert (
+            len(new_conv_nums) == 0
+        ), f"Remaining converstion number list length must be 0, not {len(new_conv_nums)}"
+
+    def split_convs(
+        self, conv_dfs: List[PacketDataset]
+    ) -> Dict[str, List[PacketDataset]]:
+        # update the splti dict
+        self.update_split_dict()
+
+        ret = {"train": [], "val": [], "test": []}
+        # Now use the indicies to split the conversations into train, validation, and test
+        # We assume that each conv_df has one and only one conversation number
+        for conv_df in conv_dfs:
+            for key, conv_nums in self.split_dict.items():
+                if conv_df.conv_num in conv_nums:
+                    ret[key].append(conv_df)
+
+        return ret
 
     def packet_it_generator(
         self, df_split: List[PacketDataset]
-    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> Iterator[ParsedPacket]:
         """
         @Description: Creates a batch stream of parsed packets from the given conversations
 
@@ -251,13 +287,13 @@ class PacketItGenerator:
                 if i > self.n_conv_packets:
                     break
                 self.cur_packet_n = i
-                yield packet.cat_features, packet.numerical_features, torch.tensor(
-                    packet.payload
-                )
+                yield packet
 
-    def generate_loaders(
-        self, csv_dir: str, epoch_num: int | None = None
-    ) -> Tuple[
+    ### Public ###
+    def update_n_packets(self, epoch_num: int = N_NUM_EPOCHS - 1):
+        self.n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
+
+    def generate_loaders(self, csv_dir: str, epoch_num: int | None = None) -> Tuple[
         PacketIterator,
         PacketIterator,
         PacketIterator,
@@ -270,7 +306,6 @@ class PacketItGenerator:
 
         @Returns:
         """
-        global conv_list, split_dict
         train_dfs = list()
         validation_dfs = list()
         test_dfs = list()
@@ -288,14 +323,14 @@ class PacketItGenerator:
         dfs = load_dfs_from_dir(csv_dir=csv_dir)
         for df in dfs:
             # Get the conversations splits
-            splits = split_into_conversations(df, conv_list=conv_list)
+            splits = self.split_into_conversations(df, conv_list=self.conv_list)
 
-            print(conv_list)
             conv_dfs = [
-                PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
+                PacketDataset(conv_df, n_convs=len(self.conv_list))
+                for conv_df in splits
             ]
 
-            train, validation, test = split_convs(conv_dfs).values()
+            train, validation, test = self.split_convs(conv_dfs).values()
 
             cat_dims = train[0].cat_dims
             num_dims = train[0].num_dims
@@ -338,6 +373,33 @@ class PacketItGenerator:
             ),
         )
 
+    def generate_conv_loaders(
+        self, csv_dir: str
+    ) -> Tuple[List[PacketDataset], List[PacketDataset], List[PacketDataset]]:
+        # Load the csv file data frames from the directory
+        csv_dfs = load_dfs_from_dir(csv_dir=csv_dir)
+
+        train = list()
+        validation = list()
+        testing = list()
+
+        for csv_df in csv_dfs:
+            splits = self.split_into_conversations(csv_df, self.conv_list)
+
+            conv_dfs = [
+                PacketDataset(conv_df, n_convs=len(self.conv_list))
+                for conv_df in splits
+            ]
+
+            # Split the conv dfs into training, validation, and testing
+            s_train, s_validation, s_testing = self.split_convs(conv_dfs=conv_dfs)
+
+            train += s_train
+            validation += s_validation
+            testing += s_testing
+
+        return train, validation, testing
+
 
 ### Custom loss functions ###
 class LabelSmoothingCrossEntropy(nn.Module):
@@ -345,7 +407,7 @@ class LabelSmoothingCrossEntropy(nn.Module):
         super().__init__()
         self.smoothing = smoothing
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor):
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred = pred.log_softmax(dim=-1)  # smooth winner takes all PDF
         n_classes = pred.size(dim=-1)
         true_dist = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
@@ -618,9 +680,9 @@ def progressive_loss(loss_vector: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid((max_loss + improvement * sequence_length) / 10) * 10
 
 
-def conversation_trajectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
+def conversation_tradjectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
     """
-    Alternative: Focus on the entire trajectory shape
+    Alternative: Focus on the entire tradjectory shape
     This gives gradients to ALL elements in the loss vector
     """
     if len(loss_vector) <= 1:
@@ -630,8 +692,8 @@ def conversation_trajectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
             else torch.tensor(0.0, device=loss_vector.device)
         )
 
-    # Ideal trajectory: exponential decay
-    # Create target trajectory
+    # Ideal tradjectory: exponential decay
+    # Create target tradjectory
     n_steps = len(loss_vector)
     x = torch.arange(n_steps, dtype=torch.float32, device=loss_vector.device)
 
@@ -639,10 +701,10 @@ def conversation_trajectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
     initial_loss = loss_vector[0].detach()  # Use actual first loss as target start
     target_decay = initial_loss * torch.exp(-x * 0.5)  # Exponential decay
 
-    # MSE between actual trajectory and ideal trajectory
-    trajectory_loss = F.mse_loss(loss_vector, target_decay)
+    # MSE between actual tradjectory and ideal tradjectory
+    tradjectory_loss = F.mse_loss(loss_vector, target_decay)
 
     # Also add improvement term
     improvement = loss_vector[0] - loss_vector[-1]
 
-    return trajectory_loss - 0.1 * improvement  # Reward improvement
+    return tradjectory_loss - 0.1 * improvement  # Reward improvement

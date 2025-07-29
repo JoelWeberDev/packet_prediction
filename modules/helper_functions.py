@@ -708,3 +708,19 @@ def conversation_tradjectory_loss(loss_vector: torch.Tensor) -> torch.Tensor:
     improvement = loss_vector[0] - loss_vector[-1]
 
     return tradjectory_loss - 0.1 * improvement  # Reward improvement
+
+
+def conversation_trajectory_loss_simple(losses: torch.Tensor):
+    """Simple trajectory loss - reward improvement over conversation"""
+
+    # Reward decreasing loss over time
+    if len(losses) > 1:
+        # Compute improvement: early_loss - late_loss (positive = improvement)
+        early_avg = losses[: len(losses) // 2].mean()
+        late_avg = losses[len(losses) // 2 :].mean()
+        improvement = early_avg - late_avg
+
+        # Loss should be negative of improvement (we want to maximize improvement)
+        return -improvement + losses.mean()  # Base loss + improvement penalty
+    else:
+        return losses.mean()

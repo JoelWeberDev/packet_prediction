@@ -19,18 +19,14 @@ from dataclasses import dataclass
 
 ### Local imports ###
 from modules.CONSTANTS import *
-from modules.preprocessing import load_df, load_dfs_from_dir, split_into_conversations
 from modules.custom_datasets import PacketDataset
 from modules.helper_functions import (
-    split_dict,
-    conv_list,
-    split_convs,
     print_update,
     plot_metrics,
     hidden_reliance_loss,
     compute_hidden_state_regularization,
     LabelSmoothingCrossEntropy,
-    PacketIterator
+    PacketItGenerator,
 )
 
 
@@ -269,7 +265,8 @@ class PacketGenerator(nn.Module):
 ### Helper functions ###
 def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
-    train_loader, val_loader, test_loader = generate_loaders(
+    pg = PacketItGenerator(csv_dir=csv_dir)
+    train_loader, val_loader, test_loader = pg.generate_loaders(
         csv_dir=csv_dir, epoch_num=0
     )
 
@@ -309,7 +306,6 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
 
         # Gradually decrease temperature and teacher forcing
         temperature = max(0.5, 1.0 - epoch / num_epochs)
-        reset_probability = max(N_MEM_RESET_PROB, 0.9 - 0.8 * epoch / num_epochs)
         model.reset_hidden()
         # tf_ratio = max(N_TEACHER_FORCING_RATIO, 1.0 - epoch * 1.5 / num_epochs)
         tf_ratio = N_TEACHER_FORCING_RATIO
@@ -325,16 +321,15 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
             max_seq_len = N_MAX_PAYLOAD_LEN  # Full sequences
 
         for i, packet in enumerate(train_loader):
-            cat_features, num_features, payload = [b.to(device) for b in packet]
+            payload = torch.tensor(packet.payload, dtype=torch.long, device=DEVICE)
+            cat_features = packet.cat_features.to(device=DEVICE)
+            num_features = packet.numerical_features.to(device=DEVICE)
 
             if len(payload) == 0:
                 continue
 
             if len(payload) > max_seq_len:
                 payload = payload[:max_seq_len]
-
-            # if random.random() < reset_probability:
-            #     model.reset_hidden()
 
             optimizer.zero_grad()
             # Forward pass with scheduled teacher forcing
@@ -344,15 +339,16 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
 
             # Compute loss and accuracy
             loss = criterion(logits.view(-1, VOCAB_DIM), payload.view(-1))
-            hidden_reliance = hidden_reliance_loss(
-                model, criterion, cat_features, num_features, payload, loss
-            )
-            if hidden_reliance == 0:
-                n_hidden_reliant += 1
+            # hidden_reliance = hidden_reliance_loss(
+            #     model, criterion, cat_features, num_features, payload, loss
+            # )
+            # if hidden_reliance == 0:
+            #     n_hidden_reliant += 1
 
-            hidden_loss = compute_hidden_state_regularization(model.hidden)
+            # hidden_loss = compute_hidden_state_regularization(model.hidden)
 
-            tot_loss = loss + hidden_reliance + hidden_loss
+            # tot_loss = loss + hidden_reliance + hidden_loss
+            tot_loss = loss
 
             # Backpropagation
             tot_loss.backward()
@@ -397,7 +393,9 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
 
         with torch.no_grad():
             for i, packet in enumerate(val_loader):
-                cat_features, num_features, payload = [b.to(device) for b in packet]
+                payload = torch.tensor(packet.payload, dtype=torch.long, device=DEVICE)
+                cat_features = packet.cat_features.to(device=DEVICE)
+                num_features = packet.numerical_features.to(device=DEVICE)
 
                 if len(payload) == 0:
                     continue
@@ -493,112 +491,9 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         #     )
 
         # Regenerate the loaders for the next epoch
-        train_loader, val_loader, test_loader = generate_loaders(
+        train_loader, val_loader, test_loader = pg.generate_loaders(
             csv_dir=csv_dir, epoch_num=epoch + 1
         )
-
-
-def packet_it_generator(
-    df_split: List[PacketDataset], epoch_num: int = N_NUM_EPOCHS - 1
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """
-    @Description: Creates a batch stream of parsed packets from the given conversations
-
-    @Notes:
-        - We return if the end of a conversation is reached before the full batch lenght is reached
-
-    @Returns: (cat_features_tensor, numerical_features_tensor, payloads_tensor)
-    """
-    # Use the epoch number to schedule how many packets will we will select from each conversation
-    n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
-    print(f"n_conv_packets: {n_conv_packets}")
-    for df in df_split:
-
-        for i, packet in enumerate(df):
-            if i > n_conv_packets:
-                break
-            yield packet.cat_features, packet.numerical_features, torch.tensor(
-                packet.payload
-            )
-
-
-def generate_loaders(csv_dir: str, epoch_num: int = N_NUM_EPOCHS - 1) -> Tuple[
-    PacketIterator,
-    PacketIterator,
-    PacketIterator,
-]:
-    """
-    @Description: Takes a general dataset, splits it into validation and training and then
-    creates loaders for each data split
-
-    @Notes:
-
-    @Returns:
-    """
-    global conv_list, split_dict
-    train_dfs = list()
-    validation_dfs = list()
-    test_dfs = list()
-
-    train_len = 0
-    validation_len = 0
-    test_len = 0
-
-    cat_dims = list()
-    num_dims = 0
-    # Load the dataset
-    dfs = load_dfs_from_dir(csv_dir=csv_dir)
-    for df in dfs:
-        # Get the conversations splits
-        splits = split_into_conversations(df, conv_list=conv_list)
-
-        print(conv_list)
-        conv_dfs = [
-            PacketDataset(conv_df, n_convs=len(conv_list)) for conv_df in splits
-        ]
-
-        train, validation, test = split_convs(conv_dfs).values()
-
-        cat_dims = train[0].cat_dims
-        num_dims = train[0].num_dims
-
-        train_dfs += train
-        validation_dfs += validation
-        test_dfs += test
-
-        for t in train:
-            train_len += len(t)
-
-        for v in validation:
-            validation_len += len(v)
-
-        for ts in test:
-            test_len += len(ts)
-
-    assert isinstance(cat_dims, list), f"The cat dims must be a list of integers"
-    assert isinstance(num_dims, int), f"The num dims must be an integer"
-
-    # Now create batch generators for each
-    return (
-        PacketIterator(
-            packet_it_generator(train_dfs, epoch_num),
-            train_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
-        PacketIterator(
-            packet_it_generator(validation_dfs, epoch_num),
-            validation_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
-        PacketIterator(
-            packet_it_generator(test_dfs, epoch_num),
-            test_len,
-            cat_dims=cat_dims,
-            num_dims=num_dims,
-        ),
-    )
 
 
 if __name__ == "__main__":

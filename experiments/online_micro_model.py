@@ -22,17 +22,32 @@ micro model rather than themselves memorizing the training data.
         will increase in lenght and granulariy as preformance improves.
         - The progressive loss function defined in the helper function looks at where the model
         began with its prediciton loss how it progressed and uses that to establish a gradient
+- Dealing with the 2 step training
+    1. Use a differentiable optimizer that we can actually run BP through
+    2. Run all the support training after the inference stage
+        - This does not work because by nature the support architechure must learn to accomodate
+        a moving target, the micro gru rather than itself overfit to the particular conversation.
+        Training the model when the micro gru is fixed will simply result in memorization of the
+        conversation in the support parameters.
 
+@Questions
+    - Should the byte embedded be included in the inference time training?
 
 @TODO:
     - Define a global random seed so that synchronous models will not be thrown off by random
     noisy initial conditions.
     - Add a scheduler for both the support component training and the micro gru
+@Next Steps 2025-06-29
+    - Periodically sample loss values for the the support training while in training mode
+    - Get to the point that the model is actually beginning to converge.
+    - Improve the efficiency of the model. At the moment it is very large and very slow
+    - Run in just inference mode to demonstrate the model's ability
 """
 
 ### Python imports ###
 import torch
 import torch.nn as nn
+import higher
 from typing import List
 from dataclasses import dataclass, field
 from copy import deepcopy
@@ -45,6 +60,7 @@ from modules.helper_functions import (
     plot_metrics,
     conversation_tradjectory_loss,
     conversation_trajectory_loss_simple,
+    get_memory,
     LabelSmoothingCrossEntropy,
     PacketItGenerator,
 )
@@ -410,43 +426,44 @@ def run_conv(
     packet_losses = []
     packet_accs = []
 
-    for packet in conv_df:
-        if len(packet.payload) == 0:
-            continue
+    with higher.innerloop_ctx(model, optimizer) as (fmodel, diffopt):
+        assert isinstance(
+            fmodel, OnlinePacketPredictor
+        ), f"functional model has type {type(fmodel)}, but expected {type(model)}"
 
-        if len(packet_ctx) == O_PACKET_CTX_LEN:
-            target_payload = torch.tensor(
-                packet.payload, dtype=torch.long, device=DEVICE
-            )
+        for packet in conv_df:
+            if len(packet.payload) == 0:
+                continue
 
-            if train:
-                optimizer.zero_grad()
+            if len(packet_ctx) == O_PACKET_CTX_LEN:
+                target_payload = torch.tensor(
+                    packet.payload, dtype=torch.long, device=DEVICE
+                )
 
-            results = model.forward(packet_ctx, packet)
-            loss = criterion(
-                results.logits.view(-1, VOCAB_DIM), target_payload.view(-1)
-            )
+                results = fmodel.forward(packet_ctx, packet)
+                loss = criterion(
+                    results.logits.view(-1, VOCAB_DIM), target_payload.view(-1)
+                )
 
-            if train:
-                loss.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                if train:
+                    # torch.nn.utils.clip_grad_norm_(fmodel.parameters(), max_norm=1.0)
+                    diffopt.step(loss)
 
-            # Store results
-            packet_losses.append(loss)
-            correct = (results.preds == target_payload).sum().item()
-            packet_accs.append(correct / len(packet.payload))
+                # Store results
+                packet_losses.append(loss)
+                correct = (results.preds == target_payload).sum().item()
+                packet_accs.append(correct / len(packet.payload))
 
-            if len(packet_losses) >= max_conv_len:
-                break
+                if len(packet_losses) >= max_conv_len:
+                    break
 
-        packet_ctx.append(packet)
-        packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
+            packet_ctx.append(packet)
+            packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
 
     return ConvResults(packet_losses, packet_accs)
 
 
-def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True):
+def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
     packet_generator = PacketItGenerator(csv_dir)
     data_split_dict = packet_generator.generate_conv_loaders(csv_dir)
@@ -458,19 +475,13 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True
     model = OnlinePacketPredictor(metadata_embedder=metadata_embeder)
 
     # Create optimizer for inference time parameters
-    if train_2_step:
-        inference_params, support_params = model.get_component_groups()
-        inference_optim = torch.optim.AdamW(
-            inference_params, lr=O_INFERENCE_LR, weight_decay=O_WEIGHT_DECAY
-        )
-        support_optim = torch.optim.AdamW(
-            support_params, lr=O_LR, weight_decay=O_WEIGHT_DECAY
-        )
-    else:
-        inference_optim = torch.optim.AdamW(
-            model.parameters(), lr=O_LR, weight_decay=O_WEIGHT_DECAY
-        )
-        support_optim = inference_optim
+    inference_params, support_params = model.get_component_groups()
+    inference_optim = torch.optim.Adam(
+        inference_params, lr=O_INFERENCE_LR, weight_decay=O_WEIGHT_DECAY
+    )
+    support_optim = torch.optim.AdamW(
+        support_params, lr=O_LR, weight_decay=O_WEIGHT_DECAY
+    )
 
     criterion = LabelSmoothingCrossEntropy(
         smoothing=O_SMOOTHING
@@ -489,8 +500,6 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True
     model_metrics = dict()
     for mode in data_split_dict.keys():
         model_metrics[mode] = ModelMetrics()
-
-    torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(num_epochs):
         # Training phase
@@ -513,14 +522,9 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True
 
             for conv_df in conv_dfs:
                 # Assess the model's preformance
-                # The model's preformance will improve based on how much difference the GRU's updates help
-                if train_2_step:
-                    model.train_mode_micro_only()
-                    model.conv_reset()
-                else:
-                    # Don't reset the model
-                    model.train()
-                    model.hidden = None
+                # Reset the model for the new conversation
+                model.train_mode_micro_only()
+                model.conv_reset()
 
                 conv_results = run_conv(
                     model,
@@ -540,7 +544,7 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True
                     )
 
                     # Loss and feedback stuff
-                    if mode == "train" and train_2_step:
+                    if mode == "train":
                         model.train_mode_support_only()
                         support_optim.zero_grad()
                         conv_loss.backward()
@@ -595,11 +599,11 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS, train_2_step: bool = True
 if __name__ == "__main__":
 
     csv_dir = "test_data"
-    csv_dir = (
-        "../datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
-    )
+    # csv_dir = (
+    #     "../datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
+    # )
     # csv_dir = (
     #     "datasets/mqtt-data/kaggle_mqtt_set/Data/PCAP/legit_cap_split/small_sample"
     # )
 
-    train_model(csv_dir=csv_dir, train_2_step=False)
+    train_model(csv_dir=csv_dir)

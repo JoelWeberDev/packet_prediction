@@ -435,9 +435,7 @@ class AdaptivePacketGenerator(nn.Module):
 def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
     packet_loader = PacketItGenerator(csv_dir=csv_dir)
-    train_loader, val_loader, test_loader = packet_loader.generate_loaders(
-        csv_dir=csv_dir, epoch_num=0
-    )
+    train_loader, val_loader, test_loader = packet_loader.generate_loaders(epoch_num=0)
 
     # Initialize the model
     model = AdaptivePacketGenerator(

@@ -91,7 +91,7 @@ METADATA_MLP_DROPOUT = 0.2
 
 
 ### Training parameters ###
-TRAIN_VAL_TEST_PERCS = np.array([0.7, 0.0, 0])
+TRAIN_VAL_TEST_PERCS = np.array([0.7, 0.3, 0])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 
 BATCH_SIZE = 32
@@ -248,12 +248,17 @@ O_PACKET_EMB_DROPOUT = 0.1
 
 # Training parameters
 O_LR = 1e-3
-O_INFERENCE_LR = 2e-3
+O_INFERENCE_LR = 5e-3
 O_MAX_LR = 3e-3
 O_WEIGHT_DECAY = 1e-5
 O_SMOOTHING = 0.1
 O_DEFAULT_TEMP = 0.9
-O_MAX_CONV_LEN = 500
+O_MAX_CONV_LEN = 100
+O_LOSS_SAMPLE_PERIOD = 5
+O_NUM_EPOCHS = 10
+O_SAVE_DIR = "source_code/results/online_learning"
+O_RESULTS_FNAME = "training_results.pkl"
+O_METADATA_FNAME = "metadata.pkl"
 
 ### Micro conversation defaults ###
 MIN_MICRO_CONV_LEN = 20

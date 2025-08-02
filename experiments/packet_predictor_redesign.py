@@ -266,9 +266,7 @@ class PacketGenerator(nn.Module):
 def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
     """Train the packet generator model"""
     pg = PacketItGenerator(csv_dir=csv_dir)
-    train_loader, val_loader, test_loader = pg.generate_loaders(
-        csv_dir=csv_dir, epoch_num=0
-    )
+    train_loader, val_loader, test_loader = pg.generate_loaders(epoch_num=0)
 
     # Initialize the model
     model = PacketGenerator(train_loader.cat_dims, numerical_dim=train_loader.num_dims)
@@ -491,9 +489,7 @@ def train_model(csv_dir: str, num_epochs=N_NUM_EPOCHS):
         #     )
 
         # Regenerate the loaders for the next epoch
-        train_loader, val_loader, test_loader = pg.generate_loaders(
-            csv_dir=csv_dir, epoch_num=epoch + 1
-        )
+        train_loader, val_loader, test_loader = pg.generate_loaders(epoch_num=epoch + 1)
 
 
 if __name__ == "__main__":

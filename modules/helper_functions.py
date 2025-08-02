@@ -9,6 +9,9 @@
 """
 
 ### Python imports ###
+import sys, os
+import subprocess
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,8 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
-from typing import List, Dict, Tuple, Iterator, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Tuple, Iterator, Optional, Any
+from dataclasses import dataclass, field
 
 ### Local imports ###
 from modules.CONSTANTS import *
@@ -44,21 +47,136 @@ class PacketIterator:
 
 
 @dataclass
+class PacketPrediction:
+    logits: torch.Tensor
+    preds: torch.Tensor
+
+
+@dataclass
 class ConvResults:
-    avg_loss: float
-    avg_acc: float
-    conv_loss: List[float]
-    conv_acc: List[float]
-    hidden_states: torch.Tensor | None
-    cell_states: torch.Tensor | None
+    packet_losses: List[torch.Tensor]
+    packet_accs: List[float]
+    conv_loss: float = float("inf")
+
+    ### Getters ###
+    @property
+    def avg_packet_loss(self) -> float:
+        return (
+            float(np.mean([v.item() for v in self.packet_losses]))
+            if len(self.packet_losses) > 0
+            else float("inf")
+        )
+
+    @property
+    def avg_packet_acc(self) -> float:
+        return (
+            float(np.mean(self.packet_accs))
+            if len(self.packet_accs) > 0
+            else float("inf")
+        )
+
+    ### Generics ###
+    def __len__(self):
+        return len(self.packet_accs)
+
+    def __str__(self) -> str:
+        return f"""
+            avg packet loss: {self.avg_packet_loss}
+            avg packet acc: {self.avg_packet_acc}
+            conv loss: {self.conv_loss}
+            num packets: {len(self)}
+        """
 
 
 @dataclass
 class EpochResults:
-    avg_train_loss: float = float("inf")
-    avg_train_acc: float = 0.0
-    avg_val_loss: float = float("inf")
-    avg_val_acc: float = 0.0
+    conv_results: List[ConvResults] = field(default_factory=list)
+    max_conv_len: int = 0
+
+    ### Getters ###
+    @property
+    def conv_packet_losses(self) -> List[float]:
+        losses = list()
+        for conv_res in self.conv_results:
+            losses.append(conv_res.avg_packet_loss)
+
+        return losses
+
+    @property
+    def conv_packet_accs(self) -> List[float]:
+        accs = list()
+        for conv_res in self.conv_results:
+            accs.append(conv_res.avg_packet_acc)
+
+        return accs
+
+    @property
+    def avg_packet_loss(self) -> float:
+        conv_losses = self.conv_packet_losses
+        return float(np.mean(conv_losses)) if len(conv_losses) > 0 else float("inf")
+
+    @property
+    def avg_packet_acc(self) -> float:
+        conv_accs = self.conv_packet_accs
+        return float(np.mean(conv_accs)) if len(conv_accs) > 0 else float("inf")
+
+    @property
+    def n_convs(self) -> int:
+        return len(self.conv_results)
+
+    @property
+    def avg_conv_loss(self) -> float:
+        # This loss measure's how well the model converges to a solution
+        conv_losses = [conv_result.conv_loss for conv_result in self.conv_results]
+        return float(np.mean(conv_losses)) if len(conv_losses) > 0 else float("inf")
+
+    ### Generics ###
+    def __len__(self):
+        n_packets = 0
+        for conv in self.conv_results:
+            n_packets += len(conv)
+        return n_packets
+
+    def __str__(self):
+        return f"""
+            epoch avg packet loss: {self.avg_packet_loss}
+            epoch avg packet acc: {self.avg_packet_acc}
+            epoch avg conv loss: {self.avg_conv_loss}
+            epoch tot num packets: {len(self)}
+            epoch num convs: {self.n_convs}
+        """
+
+
+@dataclass
+class ModelMetrics:
+    epoch_results: List[EpochResults] = field(default_factory=list)
+
+    # Properties #
+    @property
+    def epoch_avg_losses(self):
+        return [epoch_result.avg_packet_loss for epoch_result in self.epoch_results]
+
+    @property
+    def epoch_avg_accs(self):
+        return [epoch_result.avg_packet_acc for epoch_result in self.epoch_results]
+
+    @property
+    def avg_loss(self):
+        if len(self) > 0:
+            return np.mean(self.epoch_avg_losses)
+        else:
+            return float("inf")
+
+    @property
+    def avg_acc(self):
+        if len(self) > 0:
+            return np.mean(self.epoch_avg_accs)
+        else:
+            return float("inf")
+
+    # Generics #
+    def __len__(self):
+        return len(self.epoch_results)
 
 
 ### Custom helper functions ###
@@ -118,6 +236,50 @@ def plot_metrics(
     plt.ylabel(y_label)
     if title is None:
         title = f"{y_label} vs {x_label}"
+    plt.title(title)
+    plt.show()
+
+
+def process_model_metrics(metrics: Dict[str, ModelMetrics]):
+    """
+    @Description: Plots and prints an overview of the model training along with metrics
+
+    @Notes:
+        - Plot the epoch training and validation curves on the same graph
+
+    @Returns:
+    """
+    train_metrics = metrics["train"]
+    val_metrics = metrics["validation"]
+
+    # Create a plot of the average epoch losses for each
+    plt.plot(train_metrics.epoch_avg_losses)
+    plt.plot(val_metrics.epoch_avg_losses)
+    plt.xlabel("Epoch number")
+    plt.ylabel("Loss")
+    title = f"Overall training and validation loss"
+    plt.title(title)
+    plt.show()
+
+    # Accuracy plot
+    plt.plot(train_metrics.epoch_avg_accs)
+    plt.plot(val_metrics.epoch_avg_accs)
+    plt.xlabel("Epoch number")
+    plt.ylabel("Accuracy")
+    title = f"Overall training and validation Accuracy"
+    plt.title(title)
+    plt.show()
+
+    # Conversation length vs accuracy
+    conv_lens = [
+        str(epoch_result.max_conv_len) for epoch_result in train_metrics.epoch_results
+    ]
+    plt.plot(train_metrics.epoch_avg_accs)
+    plt.plot(val_metrics.epoch_avg_accs)
+    plt.xticks(np.arange(len(conv_lens)), conv_lens)
+    plt.xlabel("Packets per conversation")
+    plt.ylabel("Accuracy")
+    title = f"Overall Accuracy vs Conversation length"
     plt.title(title)
     plt.show()
 
@@ -186,6 +348,7 @@ class PacketItGenerator:
         self.cur_packet_n = 0
         self.conv_list = list()
         self.split_dict = {"train": [], "val": [], "test": []}
+        self.dfs = load_dfs_from_dir(csv_dir=csv_dir)
 
     ### Private ###
     @staticmethod
@@ -293,7 +456,7 @@ class PacketItGenerator:
     def update_n_packets(self, epoch_num: int = N_NUM_EPOCHS - 1):
         self.n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
 
-    def generate_loaders(self, csv_dir: str, epoch_num: int | None = None) -> Tuple[
+    def generate_loaders(self, epoch_num: int | None = None) -> Tuple[
         PacketIterator,
         PacketIterator,
         PacketIterator,
@@ -320,8 +483,7 @@ class PacketItGenerator:
         cat_dims = list()
         num_dims = 0
         # Load the dataset
-        dfs = load_dfs_from_dir(csv_dir=csv_dir)
-        for df in dfs:
+        for df in self.dfs:
             # Get the conversations splits
             splits = self.split_into_conversations(df, conv_list=self.conv_list)
 
@@ -373,15 +535,13 @@ class PacketItGenerator:
             ),
         )
 
-    def generate_conv_loaders(self, csv_dir: str) -> Dict[str, List[PacketDataset]]:
+    def generate_conv_loaders(self) -> Dict[str, List[PacketDataset]]:
         # Load the csv file data frames from the directory
-        csv_dfs = load_dfs_from_dir(csv_dir=csv_dir)
-
         train = list()
         validation = list()
         testing = list()
 
-        for csv_df in csv_dfs:
+        for csv_df in self.dfs:
             splits = self.split_into_conversations(csv_df, self.conv_list)
 
             conv_dfs = [
@@ -399,6 +559,75 @@ class PacketItGenerator:
             testing += s_testing
 
         return {"train": train, "validation": validation}
+
+
+### File system helpers ###
+def pkl_write_model(
+    model,
+    metrics: Dict[str, ModelMetrics],
+    save_dir: str,
+    metadata: Dict = {},
+):
+    """
+    @Description: Takes the model metrics generated during the training process and saves them to
+    pickle file so that they can be read back again for analysis.
+
+    @Notes:
+        - Any other relevant or interesting info can be passed through the metadata dictionary
+
+    @Returns:
+    """
+    assert os.path.isdir(save_dir), f"E: The directory {save_dir} does not exist"
+
+    # Save the model
+    model_path = os.path.join(save_dir, f"model_{type(model).__name__}.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump((model, metadata), f)
+
+    # Save the metrics
+    metrics_path = os.path.join(save_dir, O_RESULTS_FNAME)
+    with open(metrics_path, "wb") as f:
+        pickle.dump(metrics, f)
+
+    # Save the metadata
+    metadata_path = os.path.join(save_dir, O_METADATA_FNAME)
+    metadata["git_hash"] = get_git_hash() # Indication of 
+    with open(metadata_path, "wb") as f:
+        pickle.dump(metadata, f)
+
+
+def pkl_read_model(read_dir) -> Tuple[Any, Dict[str, ModelMetrics], Dict]:
+    assert os.path.isdir(read_dir), f"E: The directory {read_dir} does not exist"
+
+    model_path = None
+    for path in os.listdir(read_dir):
+        if "model_" in path:
+            model_path = os.path.join(read_dir, path)
+            break
+
+    model = None
+    if model_path is not None:
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+
+    metrics_path = os.path.join(read_dir, O_RESULTS_FNAME)
+    with open(metrics_path, "rb") as f:
+        metrics = pickle.load(f)
+
+    metadata_path = os.path.join(read_dir, O_METADATA_FNAME)
+    with open(metadata_path, "rb") as f:
+        metadata = pickle.load(f)
+
+    return model, metrics, metadata
+
+
+def get_git_hash() -> str:
+    try:
+        git_hash = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("ascii").strip()
+        return git_hash
+    except Exception as e:
+        print(f"E: Get git has failed with {e}")
+        return ""
 
 
 ### Custom loss functions ###

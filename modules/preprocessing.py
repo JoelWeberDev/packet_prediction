@@ -332,15 +332,18 @@ def load_df(
     return df
 
 
-def load_dfs_from_dir(csv_dir: str) -> Iterator[pd.DataFrame]:
+def load_dfs_from_dir(csv_dir: str) -> List[pd.DataFrame]:
 
     assert os.path.isdir(
         csv_dir
     ), f"The provided csv directory, {csv_dir} is not a directory"
 
+    dfs = list()
     for fname in os.listdir(csv_dir):
         if fname.endswith(".csv"):
-            yield load_df(os.path.join(csv_dir, fname))
+            dfs.append(load_df(os.path.join(csv_dir, fname)))
+
+    return dfs
 
 
 if __name__ == "__main__":

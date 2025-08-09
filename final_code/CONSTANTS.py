@@ -11,8 +11,8 @@ VOCAB_DIM = 256 + N_SPECIAL_TOKNES
 
 ### Training parameters ###
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 31
-TRAIN_VAL_TEST_PERCS = np.array([0.7, 0.3, 0])
+SEED = 32
+TRAIN_VAL_TEST_PERCS = np.array([0.5, 0.5, 0])
 TRAIN_VAL_TEST_PERCS /= np.sum(TRAIN_VAL_TEST_PERCS)
 DEBUG_MODE = True
 

@@ -11,14 +11,18 @@ import subprocess
 from typing import Iterable, List
 from dataclasses import dataclass
 from modules.CONSTANTS import *
-from copy import deepcopy
+from copy import deepcopy, copy
+
 from modules.helper_functions import (
     conversation_tradjectory_loss,
     progressive_loss,
     conversation_trajectory_loss_simple,
     get_memory,
     get_git_hash,
+    pkl_read_model,
 )
 
-
-print(get_git_hash())
+# Get all the constants that are prefixed with "O"
+for name, value in copy(globals()).items():
+    if name.startswith("O_"):
+        print(f"{name} : {value}")

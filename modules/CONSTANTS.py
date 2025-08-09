@@ -98,7 +98,8 @@ BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-5
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cpu"
 ic(f"Using device type: {DEVICE}")
 PATIENCE = 5  # minimum early stopping epochs
 CHECKPOINT_DIR = "checkpoints"
@@ -228,12 +229,12 @@ R_MEMORY_PRESSURE_EPOCHS = 8  # Number of epochs to apply memory pressure
 R_FORCE_GENERALIZATION = True  # Whether to force cross-conversation generalization
 
 ### Online packet predictor constants ###
-O_HIDDEN_SIZE = 256
+O_HIDDEN_SIZE = 64
 O_NUM_LAYERS = 2
 O_BYTE_EMB_DIM = 32
 O_HIDDEN_DROPOUT = 0.1
 O_PACKET_CTX_LEN = 4
-O_BYTE_CTX_LEN = 32
+O_BYTE_CTX_LEN = 4
 O_DROPOUT = 0.2
 
 # Meta data parameters
@@ -242,8 +243,8 @@ O_MD_DROPOUT = 0.2
 O_MD_HIDDEN_DIM = 64
 
 # Packet representation size
-O_PACKET_REP_DIM = 128
-O_PACKET_EMB_LAYERS = 2
+O_PACKET_REP_DIM = 128  # Experiment
+O_PACKET_EMB_LAYERS = 2  # Experiment
 O_PACKET_EMB_DROPOUT = 0.1
 
 # Training parameters
@@ -255,8 +256,8 @@ O_SMOOTHING = 0.1
 O_DEFAULT_TEMP = 0.9
 O_MAX_CONV_LEN = 100
 O_LOSS_SAMPLE_PERIOD = 5
-O_NUM_EPOCHS = 10
-O_SAVE_DIR = "source_code/results/online_learning"
+O_NUM_EPOCHS = 7
+O_SAVE_DIR = "results/online_learning"
 O_RESULTS_FNAME = "training_results.pkl"
 O_METADATA_FNAME = "metadata.pkl"
 

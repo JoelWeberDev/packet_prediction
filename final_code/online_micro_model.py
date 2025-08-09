@@ -1,68 +1,30 @@
 """
 @Author: Joel Weber
 @Date: 2025-07-25
-@Description: This is a completely different concept that chooses to address the overfitting issue
-by embracing it with online learning. The architechure is setup to have support components that will
-be frozen at runtime and then an intenal model such as a GRU, LSTM, or ESN actively being updated
-as the conversation progresses.
-
-@Notes:
-- The fundamental issue will be, how do we train the support components to rely on the internal
-micro model rather than themselves memorizing the training data.
-    - My proposed solution is to train the support architechure at the conversation level and
-    the micro model at the packet level.
-- Loss function design:
-    - Training:
-        - The train true to its name is for training the components for the model that will
-        remain fixed throughout the inference process.
-        - Training will happen at the conversation level. Each time we pass through a training
-        conversation we will assess the model's ability to learn throughout the progression
-        of the conversation
-        - Conversation sizes will start very small with large and abrupt adjustments, and it
-        will increase in lenght and granulariy as preformance improves.
-        - The progressive loss function defined in the helper function looks at where the model
-        began with its prediciton loss how it progressed and uses that to establish a gradient
-- Trouble remembering. During training if you are not careful it is very easy to run out of memory
-since the gradients and comp graph require so many connections.
-
-@Questions
-    - Should the byte embedded be included in the inference time training? How much does it change
-    - How well does the model do without training on the support arch?
-    - Is back prop more expensive to conduct over many layers or large vector sizes?
-
-@TODO:
-    - Define a global random seed so that synchronous models will not be thrown off by random
-    noisy initial conditions.
-    - Add a scheduler for both the support component training and the micro gru
-    - How much is it depending on the support components. Do some formal testing
-    - Save some nice graphics indicating the model's preformance
-    - !! Tune the model parameters to make it as efficient as possible. Then get details about
-    memory, cpu, and time requirements.
-
-@Next Steps 2025-07-29
-    - Periodically sample loss values for the the support training while in training mode
-    - Improve the efficiency of the model. At the moment it is very large and very slow
-    - Run in just inference mode to demonstrate the model's ability
+@Description: The online learning model is designed to learn both at the conversation
+level and the protocol level. During inference the model is always learning at the
+packet level. Then once the conversation is done and the model is in training
+we train it based on its overall preformance and progression throughout the
+conversation. This forces the inference time frozen components to learn abstractions
+of the protocol rather than simply trying to memorize every conversation.
+When a new conversation is started, the internal GRU and ouput projection are
+reset so they can learn the new conversation from a fresh start
 """
 
 ### Python imports ###
-import sys, os
+import os
 import time
 import torch
 import torch.nn as nn
 import higher
 from typing import List
-from dataclasses import dataclass, field
-from copy import deepcopy
 
 ### Local imports ###
-from modules.CONSTANTS import *
-from modules.custom_datasets import PacketDataset, ParsedPacket
-from modules.helper_functions import (
+from CONSTANTS import *
+from custom_datasets import PacketDataset, ParsedPacket
+from helper_functions import (
     print_update,
     pkl_write_model,
-    pkl_read_model,
-    conversation_tradjectory_loss,
     conversation_trajectory_loss_simple,
     process_model_metrics,
     LabelSmoothingCrossEntropy,
@@ -514,7 +476,7 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
     for epoch in range(num_epochs):
         # Training phase
         packet_generator.n_conv_packets = (
-            N_MAX_CONV_PACKETS  # Permit the max number of conv packets
+            O_MAX_CONV_LEN  # Permit the max number of conv packets
         )
 
         # Gradually decrease temperature and teacher forcing
@@ -551,10 +513,10 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
 
                 if len(conv_results.packet_losses) > 0:
                     # TBD!! what is a good loss function for this issue?
-                    # conv_loss = conversation_trajectory_loss_simple(
+                    # conv_loss = conversation_trajectory_loss(
                     #     torch.stack(conv_results.packet_losses)
                     # )
-                    conv_loss = conversation_tradjectory_loss(
+                    conv_loss = conversation_trajectory_loss_simple(
                         torch.stack(conv_results.packet_losses)
                     )
 

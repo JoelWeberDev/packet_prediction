@@ -9,7 +9,7 @@
 """
 
 ### Python imports ###
-import sys, os
+import os
 import subprocess
 import pickle
 import numpy as np
@@ -18,15 +18,14 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
-from typing import List, Dict, Tuple, Iterator, Optional, Any
+from typing import List, Dict, Tuple, Iterator, Any
 from dataclasses import dataclass, field
 from copy import copy
 
 ### Local imports ###
-from modules.CONSTANTS import *
-from modules.custom_datasets import PacketDataset, ParsedPacket
-from modules.preprocessing import load_dfs_from_dir, conversation_filter, col_values_set
+from CONSTANTS import *
+from custom_datasets import PacketDataset, ParsedPacket
+from preprocessing import load_dfs_from_dir, conversation_filter, col_values_set
 
 
 ### Custom data classes ###
@@ -323,59 +322,10 @@ def sample_with_temperature(logits: torch.Tensor, temp: float = 1.0) -> torch.Te
     return torch.multinomial(probs, 1).squeeze(-1)
 
 
-def google_get_embedding_dim(n_cats: int) -> int:
-    # Google's categorical embedding formuala
-    return min(MAX_CAT_EMB, round((n_cats * CAT_EMB_SCALAR) ** CAT_EMB_EXPO))
-
-
-def create_micro_conversations(
-    packet_loader: PacketIterator,
-    conv_len_rng: Tuple[int, int] = (MIN_MICRO_CONV_LEN, MAX_MICRO_CONV_LEN),
-) -> Iterator[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-    """
-    @Description: Splits a packet iterator into many different sub conversations
-
-    @Notes:
-        - A generic packet loader draws no distinctions between conversation boundaries.
-
-    @Returns: Iterator of PacketIterator each representing a micro conversation (chatter)
-    """
-    assert (
-        conv_len_rng[0] <= conv_len_rng[1]
-    ), f"The conversation length range lb must be less than ub {conv_len_rng}"
-    last_conv_num = None
-    micro_conv = list()
-
-    for packet in packet_loader:
-        if len(packet[2]) == 0:
-            continue
-
-        cur_conv_num = packet[0][3]  # Conversation number
-
-        if last_conv_num != cur_conv_num:
-            if len(micro_conv) >= conv_len_rng[0]:
-                yield micro_conv
-
-            micro_conv = list()
-
-        elif len(micro_conv) >= conv_len_rng[1]:
-            yield micro_conv
-            micro_conv = list()
-
-        elif len(micro_conv) >= conv_len_rng[0]:
-            if random.random() < MICRO_CONV_YIELD_PROB:
-                yield micro_conv
-                micro_conv = list()
-
-        last_conv_num = cur_conv_num
-
-        micro_conv.append(packet)
-
-
 class PacketItGenerator:
     def __init__(self, csv_dir: str):
         self.csv_dir = csv_dir
-        self.n_conv_packets = N_MAX_CONV_PACKETS
+        self.n_conv_packets = O_MAX_CONV_LEN
         self.cur_packet_n = 0
         self.conv_list = list()
         self.split_dict = {"train": [], "val": [], "test": []}
@@ -484,8 +434,8 @@ class PacketItGenerator:
                 yield packet
 
     ### Public ###
-    def update_n_packets(self, epoch_num: int = N_NUM_EPOCHS - 1):
-        self.n_conv_packets = int(N_MAX_CONV_PACKETS * (1 + epoch_num) / N_NUM_EPOCHS)
+    def update_n_packets(self, epoch_num: int = O_NUM_EPOCHS - 1):
+        self.n_conv_packets = int(O_MAX_CONV_LEN * (1 + epoch_num) / O_NUM_EPOCHS)
 
     def generate_loaders(self, epoch_num: int | None = None) -> Tuple[
         PacketIterator,
@@ -679,7 +629,7 @@ def get_git_hash() -> str:
 
 ### Custom loss functions ###
 class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, smoothing: float = P_SMOOTHING):
+    def __init__(self, smoothing: float = O_SMOOTHING):
         super().__init__()
         self.smoothing = smoothing
 
@@ -689,242 +639,6 @@ class LabelSmoothingCrossEntropy(nn.Module):
         true_dist = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
         true_dist = true_dist * (1 - self.smoothing) + self.smoothing / n_classes
         return torch.mean(torch.sum(-true_dist * pred, dim=-1))
-
-
-def hidden_state_contrast_loss(
-    model, cat_features, num_features, payload
-) -> torch.Tensor:
-    """Force hidden states to be different for different inputs but consistent for the same input"""
-
-    # First forward pass
-    model.reset_hidden()
-    logits1, preds1 = model(cat_features, num_features, payload)
-    hidden1 = model.hidden.detach().clone()
-
-    # Second forward pass with same input - should produce similar hidden state
-    model.reset_hidden()
-    logits2, preds2 = model(cat_features, num_features, payload)
-    hidden2 = model.hidden.detach().clone()
-
-    # Third forward pass with perturbed input - should produce different hidden state
-    perturbed_cat = cat_features.clone()
-    # Slightly change categorical features
-    if random.random() > 0.5 and perturbed_cat.numel() > 0:
-        idx = random.randint(0, perturbed_cat.numel() - 1)
-        perturbed_cat.view(-1)[idx] = (
-            perturbed_cat.view(-1)[idx] + 1
-        ) % perturbed_cat.max()
-
-    model.reset_hidden()
-    _, _ = model(perturbed_cat, num_features, payload)
-    hidden3 = model.hidden.detach().clone()
-
-    # Calculate similarity between same inputs (should be high)
-    same_sim = F.cosine_similarity(hidden1.view(-1), hidden2.view(-1), dim=0)
-
-    # Calculate similarity between different inputs (should be low)
-    diff_sim = F.cosine_similarity(hidden1.view(-1), hidden3.view(-1), dim=0)
-
-    # We want same_sim to be high (close to 1) and diff_sim to be low
-    return torch.tensor(
-        max(1e-6, (1 - same_sim.item()) + max(0, diff_sim.item() - 0.5))
-    )
-
-
-def hidden_reliance_loss(
-    model,
-    criterion,
-    cat_features,
-    num_features,
-    payload,
-    h_loss,
-    scale: float = 1.0,
-    margin: float = HIDDEN_RELIANCE_MARGIN,
-) -> torch.Tensor:
-    """
-    @Description: Computes a loss that punishes accurate results when the hidden state is None.
-    This effectively punishes explicit sequence memorization and builds reliance on the hidden
-    state.
-
-    @Notes:
-        - This uses a reflected scaled logistic function to invert the loss reward structure
-        - desired: noh_loss - h_loss > margin
-
-    @Returns:
-    """
-    # Get the loss when hidden state is reset
-    orig_hidden = None
-    if model.hidden is not None:
-        orig_hidden = model.hidden.detach().clone()
-
-    model.reset_hidden()
-    noh_logits, _ = model(cat_features, num_features, payload)
-    noh_loss = criterion(noh_logits, payload)
-
-    # restore the hidden state
-    model.reset_hidden()
-    model.hidden = orig_hidden
-
-    diff = noh_loss - h_loss
-
-    # return torch.relu(margin - noh_loss + h_loss) * scale
-    # return scale * torch.exp(-(diff - margin))
-    return scale * (1 - torch.sigmoid((diff - margin) * 5))
-
-
-def compute_hidden_state_regularization(hidden) -> torch.Tensor:
-    """Penalize low variance in hidden states (static memory)"""
-    if hidden is None:
-        return torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
-
-    # Calculate variance across hidden dimensions
-    mean_hidden = torch.mean(hidden, dim=2, keepdim=True)
-    variance = torch.mean((hidden - mean_hidden).pow(2))
-
-    # Penalize low variance (want dynamic, changing hidden states)
-    return 0.1 * torch.exp(-variance * 5)
-
-
-def diversity_loss(predictions: torch.Tensor, window_size: int = 5) -> torch.Tensor:
-    """Penalize repetitive predictions within a sliding window"""
-    if len(predictions) < window_size:
-        return torch.tensor(0.0, device=predictions.device)
-
-    loss = torch.tensor(0.0, device=predictions.device)
-    count = 0
-    for i in range(len(predictions) - window_size + 1):
-        window = predictions[i : i + window_size]
-        unique_tokens = len(torch.unique(window))
-        # Penalize low diversity (fewer unique tokens)
-        diversity_score = unique_tokens / window_size
-        loss += (1 - diversity_score) ** 2
-        count += 1
-
-    return loss / max(1, count)
-
-
-def entropy_regularization(
-    logits: torch.Tensor, target_entropy: float = 2.0
-) -> torch.Tensor:
-    """Encourage higher entropy in predictions to prevent collapse"""
-    probs = F.softmax(logits, dim=-1)
-    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-    target = torch.full_like(entropy, target_entropy)
-    return F.mse_loss(entropy, target)
-
-
-def pattern_break_loss(hidden_states: List[torch.Tensor]) -> torch.Tensor:
-    """Penalize similar hidden states across different time steps"""
-    if len(hidden_states) < 2:
-        device = hidden_states[0].device if hidden_states else torch.device("cpu")
-        return torch.tensor(0.0, device=device)
-
-    loss = torch.tensor(0.0, device=hidden_states[0].device)
-    count = 0
-
-    # Compare hidden states across time steps
-    for i in range(len(hidden_states)):
-        for j in range(
-            i + 1, min(i + 5, len(hidden_states))
-        ):  # Compare with next 4 states
-            sim = F.cosine_similarity(
-                hidden_states[i].view(-1), hidden_states[j].view(-1), dim=0
-            )
-            # Penalize high similarity
-            loss += torch.relu(sim - 0.3)  # Only penalize if similarity > 0.3
-            count += 1
-
-    return loss / max(1, count)
-
-
-def sequence_memorization_loss(
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    memory_bank: Optional[Dict[str, int]] = None,
-) -> torch.Tensor:
-    """
-    @Description: Takes the dictionary of the past n most frequent sequences, checks if the current
-    prediction is identical and invokes a punishment if that is the case.
-
-    @Notes:
-        - Currently in this loss function there is no reward for getting the entire sequence correct
-        Since we are using an ensamble of loss functions, the others will yield reward for a correct
-        predition. This is simply intended to generalize
-
-    @Returns:
-    """
-    if memory_bank is None:
-        return torch.tensor(0.0, device=predictions.device)
-
-    # Convert predictions to string key for lookup
-    pred_seq = tuple(predictions.cpu().numpy())
-    target_seq = tuple(targets.cpu().numpy())
-
-    # Penalize if this exact sequence has been seen many times
-    seq_key = str(pred_seq)
-    frequency = memory_bank.get(seq_key, 0)
-
-    # Higher penalty for more frequent sequences
-    if frequency > 2:  # If seen more than 2 times
-        penalty = torch.tensor(float(frequency - 2) * 0.1, device=predictions.device)
-        return penalty
-
-    return torch.tensor(0.0, device=predictions.device)
-
-
-def apply_sequence_augmentation(
-    payload: torch.Tensor, epoch: int, total_epochs: int
-) -> torch.Tensor:
-    """
-    @Description:
-
-    @Notes:
-
-    @Returns:
-    """
-
-    # If the sequence is too short, don't purturb it any more
-    if len(payload) <= R_MIN_KEEP_LENGTH:
-        return payload
-
-    augmented = payload.clone()
-
-    # Progressive augmentation - more aggressive early in training
-    aug_intensity = max(0.1, 1.0 - (epoch / total_epochs))
-
-    # 1. Random byte dropping this actually shortens the sequence
-    # TBD! Since the sequence length is something provided in the meta data, we would like to
-    # keep the lengths the same. Masking provides a similar result without the nasty side effects
-    # if random.random() < R_SEQUENCE_DROP_PROB * aug_intensity:
-    #     max_drop = min(
-    #         int(len(payload) * R_MAX_DROP_RATIO), len(payload) - R_MIN_KEEP_LENGTH
-    #     )
-    #     if max_drop > 0:
-    #         n_drop = random.randint(1, max_drop)
-    #         drop_indices = random.sample(range(len(payload)), n_drop)
-    #         # Create mask and remove dropped indices
-    #         mask = torch.ones(len(payload), dtype=torch.bool)
-    #         mask[drop_indices] = False
-    #         augmented = augmented[mask]
-
-    # 2. Random subsequence shuffling
-    if random.random() < R_SEQUENCE_SHUFFLE_PROB * aug_intensity and len(augmented) > 4:
-        # Shuffle small chunks to break local patterns
-        chunk_size = random.randint(2, min(4, len(augmented) // 2))
-        start_idx = random.randint(0, len(augmented) - chunk_size)
-        chunk = augmented[start_idx : start_idx + chunk_size].clone()
-        # Shuffle within chunk
-        shuffle_idx = torch.randperm(chunk_size)
-        augmented[start_idx : start_idx + chunk_size] = chunk[shuffle_idx]
-
-    # 3. Random masking of bytes
-    if random.random() < R_SEQUENCE_MASK_PROB * aug_intensity:
-        n_mask = random.randint(1, min(3, len(augmented)))
-        mask_indices = random.sample(range(len(augmented)), n_mask)
-        for idx in mask_indices:
-            augmented[idx] = MASK
-
-    return augmented
 
 
 def progressive_loss(loss_vector: torch.Tensor) -> torch.Tensor:

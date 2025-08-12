@@ -10,19 +10,48 @@ import higher
 import subprocess
 from typing import Iterable, List
 from dataclasses import dataclass
-from modules.CONSTANTS import *
 from copy import deepcopy, copy
 
-from modules.helper_functions import (
-    conversation_tradjectory_loss,
-    progressive_loss,
-    conversation_trajectory_loss_simple,
-    get_memory,
-    get_git_hash,
-    pkl_read_model,
-)
 
-# Get all the constants that are prefixed with "O"
-for name, value in copy(globals()).items():
-    if name.startswith("O_"):
-        print(f"{name} : {value}")
+p = np.array(
+    [
+        [
+            0.371,
+            0.921,
+            0.488,
+            0.236,
+            0.530,
+            0.954,
+            0.236,
+            0.402,
+            0.979,
+            0.477,
+        ]
+    ]
+)
+p /= np.linalg.norm(p)
+p = torch.tensor(p)
+
+q = np.array(
+    [
+        0.879,
+        0.340,
+        0.988,
+        0.126,
+        0.699,
+        0.042,
+        0.476,
+        0.414,
+        0.316,
+        0.399,
+    ]
+)
+q /= np.linalg.norm(q)
+
+criterion = nn.CrossEntropyLoss()
+
+for i in range(10):
+    guess = torch.tensor([i])
+    loss = criterion.forward(p, guess)
+
+    print(f"{i}: {loss.item()}")

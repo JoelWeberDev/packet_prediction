@@ -539,7 +539,9 @@ class PacketItGenerator:
             validation += s_validation
             testing += s_testing
 
-        return {"train": train, "validation": validation}
+        # return {"train": train, "validation": validation}
+        # TMP test change
+        return {"validation": train, "train": validation}
 
 
 ### File system helpers ###
@@ -639,6 +641,9 @@ class LabelSmoothingCrossEntropy(nn.Module):
         true_dist = torch.zeros_like(pred).scatter(1, target.unsqueeze(1), 1)
         true_dist = true_dist * (1 - self.smoothing) + self.smoothing / n_classes
         return torch.mean(torch.sum(-true_dist * pred, dim=-1))
+
+class FocusLoss(nn.Module):
+    
 
 
 def progressive_loss(loss_vector: torch.Tensor) -> torch.Tensor:

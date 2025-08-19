@@ -28,4 +28,9 @@ Here some ideas to accompish this
 
 ### Cross entropy loss
   Basic formula entropy = sum(-p_i * log(p_i))
-  Now cross entropy is something similar except rather than computing the entropy with a single distribution we use 2 distributions, one for the weight and the other for the log. 
+  Now cross entropy is something similar except rather than computing the entropy with a single distribution we use 2 distributions, one for the weight and the other for the log.
+
+## TODO 
+  - Compare a few more loss functions
+  - Create a plot showing the preformance of all the different loss validations
+  - Demonstrate how accuracy improves over time

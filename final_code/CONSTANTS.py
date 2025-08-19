@@ -88,3 +88,6 @@ O_NUM_EPOCHS = 7
 O_SAVE_DIR = "results/online_learning"
 O_RESULTS_FNAME = "training_results.pkl"
 O_METADATA_FNAME = "metadata.pkl"
+O_GAMMA = 5
+O_ALPHA = 0.25
+O_NO_TRAIN_N_PACKETS = 50

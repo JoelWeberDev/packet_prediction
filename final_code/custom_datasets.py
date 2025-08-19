@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from icecream import ic
 
 # Local imports
-from CONSTANTS import *
-from preprocessing import extract_features
+from final_code.CONSTANTS import *
+from final_code.preprocessing import extract_features
 
 
 ### Custom data structures ###

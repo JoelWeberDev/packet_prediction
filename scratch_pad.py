@@ -12,46 +12,11 @@ from typing import Iterable, List
 from dataclasses import dataclass
 from copy import deepcopy, copy
 
+# Local includes
+from final_code.helper_functions import FocusLoss
 
-p = np.array(
-    [
-        [
-            0.371,
-            0.921,
-            0.488,
-            0.236,
-            0.530,
-            0.954,
-            0.236,
-            0.402,
-            0.979,
-            0.477,
-        ]
-    ]
-)
-p /= np.linalg.norm(p)
-p = torch.tensor(p)
 
-q = np.array(
-    [
-        0.879,
-        0.340,
-        0.988,
-        0.126,
-        0.699,
-        0.042,
-        0.476,
-        0.414,
-        0.316,
-        0.399,
-    ]
-)
-q /= np.linalg.norm(q)
+t = torch.ones(18)
+z = torch.zeros((18, 258))
 
-criterion = nn.CrossEntropyLoss()
-
-for i in range(10):
-    guess = torch.tensor([i])
-    loss = criterion.forward(p, guess)
-
-    print(f"{i}: {loss.item()}")
+print(z.squeeze(1).shape)

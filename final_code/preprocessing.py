@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import Type, Union, Dict, List
 
 # Local imports
-from CONSTANTS import *
+from final_code.CONSTANTS import *
 
 
 ### object definitions ###

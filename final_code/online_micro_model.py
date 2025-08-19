@@ -26,8 +26,10 @@ from helper_functions import (
     print_update,
     pkl_write_model,
     conversation_trajectory_loss_simple,
+    conversation_tradjectory_loss,
     process_model_metrics,
     LabelSmoothingCrossEntropy,
+    FocusLoss,
     PacketItGenerator,
     PacketPrediction,
     ConvResults,
@@ -411,9 +413,11 @@ def inference_conv(
                 results.logits.view(-1, VOCAB_DIM), target_payload.view(-1)
             )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # TBD!! how should the training cut off be done?
+            if packet_cnt < O_NO_TRAIN_N_PACKETS:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
             packet_losses.append(loss.detach())
             correct = (results.preds == target_payload).sum().item()
@@ -459,8 +463,9 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
     # criterion = LabelSmoothingCrossEntropy(
     #     smoothing=O_SMOOTHING
     # )  # Label smoothing for robustness
-    criterion = nn.CrossEntropyLoss()
-    
+    # criterion = nn.CrossEntropyLoss()
+    criterion = FocusLoss(gamma=O_GAMMA, alpha=O_ALPHA)
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         support_optim,
         max_lr=O_MAX_LR,
@@ -515,12 +520,12 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
 
                 if len(conv_results.packet_losses) > 0:
                     # TBD!! what is a good loss function for this issue?
-                    # conv_loss = conversation_trajectory_loss(
-                    #     torch.stack(conv_results.packet_losses)
-                    # )
-                    conv_loss = conversation_trajectory_loss_simple(
+                    conv_loss = conversation_tradjectory_loss(
                         torch.stack(conv_results.packet_losses)
                     )
+                    # conv_loss = conversation_trajectory_loss_simple(
+                    #     torch.stack(conv_results.packet_losses)
+                    # )
 
                     # Loss and feedback stuff
                     if mode == "train":

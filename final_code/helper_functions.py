@@ -23,9 +23,13 @@ from dataclasses import dataclass, field
 from copy import copy
 
 ### Local imports ###
-from CONSTANTS import *
-from custom_datasets import PacketDataset, ParsedPacket
-from preprocessing import load_dfs_from_dir, conversation_filter, col_values_set
+from final_code.CONSTANTS import *
+from final_code.custom_datasets import PacketDataset, ParsedPacket
+from final_code.preprocessing import (
+    load_dfs_from_dir,
+    conversation_filter,
+    col_values_set,
+)
 
 
 ### Custom data classes ###
@@ -642,8 +646,36 @@ class LabelSmoothingCrossEntropy(nn.Module):
         true_dist = true_dist * (1 - self.smoothing) + self.smoothing / n_classes
         return torch.mean(torch.sum(-true_dist * pred, dim=-1))
 
+
 class FocusLoss(nn.Module):
-    
+    def __init__(self, gamma: float = 2.0, alpha: float = 0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+
+        pred_dist = torch.softmax(pred, 1)
+
+        # Now create get the indicies of the outputs that remain differentiable
+        target_mask = torch.zeros_like(pred_dist)
+        target_mask.scatter_(1, target.unsqueeze(1), 1)
+
+        pt = (pred_dist * target_mask).sum(dim=1)
+
+        focus_weights = (1 - pt) ** self.gamma
+
+        # Apply alpha for a weight imbalance
+        # if self.alpha > 0:
+        #     alpha_t = self.alpha * target_mask + (1 - self.alpha) * (1 - target_mask)
+        #     focus_weights = alpha_t.squeeze(1) * focus_weights
+
+        ce_loss = F.cross_entropy(pred, target, reduction="none")
+
+        loss = focus_weights * ce_loss
+
+        # Reduct the loss into a single value
+        return loss.mean()
 
 
 def progressive_loss(loss_vector: torch.Tensor) -> torch.Tensor:

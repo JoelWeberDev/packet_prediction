@@ -480,11 +480,11 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
         support_params, lr=O_LR, weight_decay=O_WEIGHT_DECAY
     )
 
-    # criterion = LabelSmoothingCrossEntropy(
-    #     smoothing=O_SMOOTHING
-    # )  # Label smoothing for robustness
+    criterion = LabelSmoothingCrossEntropy(
+        smoothing=O_SMOOTHING
+    )  # Label smoothing for robustness
     # criterion = nn.CrossEntropyLoss()
-    criterion = FocusLoss(gamma=O_GAMMA, alpha=O_ALPHA)
+    # criterion = FocusLoss(gamma=O_GAMMA, alpha=O_ALPHA)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         support_optim,

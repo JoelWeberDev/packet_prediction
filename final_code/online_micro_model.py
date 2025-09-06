@@ -193,13 +193,26 @@ class OnlinePacketPredictor(nn.Module):
         )
 
         # Micro model GRU
-        self.micro_byte_gru = nn.GRU(
+        # self.micro_byte_gru = nn.GRU(
+        #     input_size=self.input_size,
+        #     hidden_size=O_HIDDEN_SIZE,
+        #     num_layers=O_NUM_LAYERS,
+        #     dropout=O_DROPOUT,
+        #     batch_first=True,
+        # )
+
+        # Micro model LSTM
+        self.micro_byte_gru = nn.LSTM(
             input_size=self.input_size,
             hidden_size=O_HIDDEN_SIZE,
             num_layers=O_NUM_LAYERS,
             dropout=O_DROPOUT,
             batch_first=True,
         )
+        
+        # Micro model ESN
+        # TODO implement ESN
+
 
         # Output Projection
         self.output_projection = nn.Linear(O_HIDDEN_SIZE, VOCAB_DIM)
@@ -261,14 +274,21 @@ class OnlinePacketPredictor(nn.Module):
         for i in range(payload_len):
             byte_ctx = ctx_payload[i : i + O_BYTE_CTX_LEN].flatten()
 
-            # Generate the lstm input
-            lstm_input = torch.cat(
+            # Generate the input
+            model_input = torch.cat(
                 [packet_ctx_emb, metadata_emb, byte_ctx], dim=-1
             ).unsqueeze(0)
 
+            # GRU version
+            # output, self.hidden = self.micro_byte_gru(
+            #     model_input, self.hidden.detach() if self.hidden is not None else None
+            # )
+
+            # LSTM version
             output, self.hidden = self.micro_byte_gru(
-                lstm_input, self.hidden.detach() if self.hidden is not None else None
+                model_input, (self.hidden[0].detach(), self.hidden[1].detach()) if self.hidden is not None else None
             )
+
 
             # Create a projection
             logits = self.output_projection(output)

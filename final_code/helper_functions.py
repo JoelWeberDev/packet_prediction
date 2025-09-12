@@ -632,6 +632,8 @@ def get_git_hash() -> str:
         print(f"E: Get git has failed with {e}")
         return ""
 
+def get_num_model_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
 
 ### Custom loss functions ###
 class LabelSmoothingCrossEntropy(nn.Module):

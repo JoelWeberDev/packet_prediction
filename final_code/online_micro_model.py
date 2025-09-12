@@ -28,6 +28,7 @@ from helper_functions import (
     conversation_trajectory_loss_simple,
     conversation_tradjectory_loss,
     process_model_metrics,
+    get_num_model_params,
     LabelSmoothingCrossEntropy,
     FocusLoss,
     PacketItGenerator,
@@ -177,12 +178,22 @@ class OnlinePacketPredictor(nn.Module):
 
         self.metadata_embedder = metadata_embedder
 
+        print(
+            f"Metadata Embedder num params: {get_num_model_params(self.metadata_embedder)}"
+        )
+
         # Byte Embeddings
         self.byte_embedder = nn.Embedding(VOCAB_DIM, O_BYTE_EMB_DIM)  # Inference Frozen
+
+        print(f"Byte Embedder num params: {get_num_model_params(self.byte_embedder)}")
 
         # Create the packet embedder
         self.packet_embedder = PacketEmbedder(
             metadata_embedder=metadata_embedder, byte_embedder=self.byte_embedder
+        )
+
+        print(
+            f"Packet Embedder num params: {get_num_model_params(self.packet_embedder)}"
         )
 
         # Input size for each step
@@ -219,10 +230,10 @@ class OnlinePacketPredictor(nn.Module):
             batch_first=True,
         )
 
-        
+        print(f"Micro GRU size: {get_num_model_params(self.micro_byte_gru)}")
+
         # Micro model ESN
         # TODO implement ESN
-
 
         # Output Projection
         self.output_projection = nn.Linear(O_HIDDEN_SIZE, VOCAB_DIM)
@@ -506,6 +517,8 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
         total_steps=num_epochs * len(data_split_dict["train"]),
         pct_start=0.1,
     )
+
+    print(sum(p.numel() for p in model.parameters()))
 
     model.to(device=DEVICE)
 

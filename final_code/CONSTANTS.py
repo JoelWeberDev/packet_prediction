@@ -71,7 +71,7 @@ O_MD_DROPOUT = 0.2
 O_MD_HIDDEN_DIM = 64
 
 # Packet representation size
-O_PACKET_REP_DIM = 128  # Experiment
+O_PACKET_REP_DIM = 32  # Experiment
 O_PACKET_EMB_LAYERS = 2  # Experiment
 O_PACKET_EMB_DROPOUT = 0.1
 

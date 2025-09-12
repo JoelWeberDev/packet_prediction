@@ -193,13 +193,13 @@ class OnlinePacketPredictor(nn.Module):
         )
 
         # Micro model GRU
-        # self.micro_byte_gru = nn.GRU(
-        #     input_size=self.input_size,
-        #     hidden_size=O_HIDDEN_SIZE,
-        #     num_layers=O_NUM_LAYERS,
-        #     dropout=O_DROPOUT,
-        #     batch_first=True,
-        # )
+        self.micro_byte_gru = nn.GRU(
+            input_size=self.input_size,
+            hidden_size=O_HIDDEN_SIZE,
+            num_layers=O_NUM_LAYERS,
+            dropout=O_DROPOUT,
+            batch_first=True,
+        )
 
         # Micro model LSTM
         # self.micro_byte_gru = nn.LSTM(
@@ -210,19 +210,8 @@ class OnlinePacketPredictor(nn.Module):
         #     batch_first=True,
         # )
 
-        # Micro model RNN
-        self.micro_byte_gru = nn.RNN(
-            input_size=self.input_size,
-            hidden_size=O_HIDDEN_SIZE,
-            num_layers=O_NUM_LAYERS,
-            dropout=O_DROPOUT,
-            batch_first=True,
-        )
-
-        
         # Micro model ESN
         # TODO implement ESN
-
 
         # Output Projection
         self.output_projection = nn.Linear(O_HIDDEN_SIZE, VOCAB_DIM)
@@ -296,12 +285,12 @@ class OnlinePacketPredictor(nn.Module):
 
             # LSTM version
             # output, self.hidden = self.micro_byte_gru(
-            #     model_input, (self.hidden[0].detach(), self.hidden[1].detach()) if self.hidden is not None else None
-            # )
-
-            # RNN version
-            # output, self.hidden = self.micro_byte_gru(
-            #     model_input, self.hidden.detach() if self.hidden is not None else None
+            #     model_input,
+            #     (
+            #         (self.hidden[0].detach(), self.hidden[1].detach())
+            #         if self.hidden is not None
+            #         else None
+            #     ),
             # )
 
             # Create a projection
@@ -494,11 +483,11 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
         support_params, lr=O_LR, weight_decay=O_WEIGHT_DECAY
     )
 
-    criterion = LabelSmoothingCrossEntropy(
-        smoothing=O_SMOOTHING
-    )  # Label smoothing for robustness
+    # criterion = LabelSmoothingCrossEntropy(
+    #     smoothing=O_SMOOTHING
+    # )  # Label smoothing for robustness
     # criterion = nn.CrossEntropyLoss()
-    # criterion = FocusLoss(gamma=O_GAMMA, alpha=O_ALPHA)
+    criterion = FocusLoss(gamma=O_GAMMA, alpha=O_ALPHA)
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         support_optim,

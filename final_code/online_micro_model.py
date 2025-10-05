@@ -28,6 +28,8 @@ from helper_functions import (
     conversation_trajectory_loss_simple,
     conversation_tradjectory_loss,
     process_model_metrics,
+    get_num_model_params,
+    get_used_memory,
     LabelSmoothingCrossEntropy,
     FocusLoss,
     PacketItGenerator,
@@ -177,12 +179,22 @@ class OnlinePacketPredictor(nn.Module):
 
         self.metadata_embedder = metadata_embedder
 
+        print(
+            f"Metadata Embedder num params: {get_num_model_params(self.metadata_embedder)}"
+        )
+
         # Byte Embeddings
         self.byte_embedder = nn.Embedding(VOCAB_DIM, O_BYTE_EMB_DIM)  # Inference Frozen
+
+        print(f"Byte Embedder num params: {get_num_model_params(self.byte_embedder)}")
 
         # Create the packet embedder
         self.packet_embedder = PacketEmbedder(
             metadata_embedder=metadata_embedder, byte_embedder=self.byte_embedder
+        )
+
+        print(
+            f"Packet Embedder num params: {get_num_model_params(self.packet_embedder)}"
         )
 
         # Input size for each step
@@ -209,6 +221,17 @@ class OnlinePacketPredictor(nn.Module):
         #     dropout=O_DROPOUT,
         #     batch_first=True,
         # )
+
+        # Micro model RNN
+        self.micro_byte_gru = nn.RNN(
+            input_size=self.input_size,
+            hidden_size=O_HIDDEN_SIZE,
+            num_layers=O_NUM_LAYERS,
+            dropout=O_DROPOUT,
+            batch_first=True,
+        )
+
+        print(f"Micro GRU size: {get_num_model_params(self.micro_byte_gru)}")
 
         # Micro model ESN
         # TODO implement ESN
@@ -300,6 +323,11 @@ class OnlinePacketPredictor(nn.Module):
 
             preds[i] = logits.argmax(dim=-1)
 
+            # Now update the context with the prediction
+            pred_emb = self.byte_embedder(preds[i].unsqueeze(0))
+
+            ctx_payload[O_BYTE_CTX_LEN + i, :] = pred_emb
+
         return PacketPrediction(logits=res_logits, preds=preds)
 
     ### Helper functions ###
@@ -358,6 +386,7 @@ def train_conv(
     packet_ctx = []
     packet_losses = []
     packet_accs = []
+    packet_lens = []
     packet_cnt = 0
 
     with higher.innerloop_ctx(model, optimizer) as (fmodel, diffopt):
@@ -385,6 +414,7 @@ def train_conv(
                 packet_losses.append(loss)
                 correct = (results.preds == target_payload).sum().item()
                 packet_accs.append(correct / len(packet.payload))
+                packet_lens.append(len(packet.payload))
 
                 packet_cnt += 1
 
@@ -400,7 +430,9 @@ def train_conv(
             packet_ctx.append(packet)
             packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
 
-    return ConvResults(packet_losses, packet_accs)
+    return ConvResults(
+        packet_losses, packet_accs, packet_lens=packet_lens, mem_usage=get_used_memory()
+    )
 
 
 def inference_conv(
@@ -420,6 +452,7 @@ def inference_conv(
     packet_ctx = []
     packet_losses = []
     packet_accs = []
+    packet_lens = []
     packet_cnt = 0
 
     for packet in conv_df:
@@ -445,6 +478,7 @@ def inference_conv(
             packet_losses.append(loss.detach())
             correct = (results.preds == target_payload).sum().item()
             packet_accs.append(correct / len(packet.payload))
+            packet_lens.append(len(packet.payload))
 
             packet_cnt += 1
 
@@ -456,7 +490,9 @@ def inference_conv(
         packet_ctx.append(packet)
         packet_ctx = packet_ctx[-O_PACKET_CTX_LEN:]
 
-    return ConvResults(packet_losses, packet_accs)
+    return ConvResults(
+        packet_losses, packet_accs, packet_lens=packet_lens, mem_usage=get_used_memory()
+    )
 
 
 def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
@@ -496,6 +532,8 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
         pct_start=0.1,
     )
 
+    print(sum(p.numel() for p in model.parameters()))
+
     model.to(device=DEVICE)
 
     # Metrics #
@@ -517,6 +555,7 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
         model.temperature = temperature
 
         for mode, conv_dfs in data_split_dict.items():
+            print(mode)
             mode_results = EpochResults()
             mode_results.max_conv_len = max_conv_len
 
@@ -586,7 +625,6 @@ def train_model(csv_dir: str, model=None, num_epochs=O_NUM_EPOCHS):
                 torch.cuda.empty_cache()
 
             if mode_results.n_convs > 0:
-                print(f"Mode: {mode}, n_convs: {mode_results.n_convs}")
                 model_metrics[mode].epoch_results.append(mode_results)
 
         # plot the losses and accuracies

@@ -20,3 +20,7 @@ t = torch.ones(18)
 z = torch.zeros((18, 258))
 
 print(z.squeeze(1).shape)
+
+t = torch.zeros((1, 10))
+
+print(t.size())

@@ -60,8 +60,10 @@ class PacketPrediction:
 class ConvResults:
     packet_losses: List[torch.Tensor]
     packet_accs: List[float]
+    packet_lens: List[float]
     tot_time: float = float("inf")
     conv_loss: float = float("inf")
+    mem_usage: float = 0.0
 
     ### Getters ###
     @property
@@ -79,6 +81,28 @@ class ConvResults:
             if len(self.packet_accs) > 0
             else float("inf")
         )
+
+    @property
+    def total_packet_len(self) -> float:
+        return (
+            float(np.sum(self.packet_lens))
+            if len(self.packet_lens) > 0
+            else 0.0
+        )
+
+    @property
+    def avg_data_rate(self) -> float:
+        """
+        @Description: Gets the average data transmission rate that the model operating
+        under its current configuration could supply
+        
+        @Notes: 
+            - All units are in bytes per second
+        
+        @Returns:
+        """
+        
+        return self.total_packet_len / self.tot_time
 
     ### Generics ###
     def __len__(self):
@@ -135,6 +159,38 @@ class EpochResults:
         return float(np.mean(train_times)) if len(train_times) > 0 else float("inf")
 
     @property
+    def avg_memory_usage(self) -> float:
+        conv_mem_usages = [conv.mem_usage for conv in self.conv_results]
+        return (
+            float(np.mean(conv_mem_usages))
+            if len(conv_mem_usages) > 0
+            else float("inf")
+        )
+
+    @property
+    def avg_data_rate(self) -> float:
+        """
+        @Description: Gets the average data transmission rate that the model operating
+        under its current configuration could supply
+        
+        @Notes: 
+            - All units are in bytes per second
+        
+        @Returns:
+        """
+        return float(np.sum([conv.avg_data_rate for conv in self.conv_results])) if len(self.conv_results) > 0 else 0.0
+        
+    @property
+    def avg_packet_len(self) -> float:
+        conv_avg_packet_lens = [conv.total_packet_len / len(conv) if len(conv) > 0 else 0.0 for conv in self.conv_results]
+
+        return (
+            float(np.mean(conv_avg_packet_lens))
+            if len(conv_avg_packet_lens) > 0
+            else float("inf")
+        )
+
+    @property
     def n_convs(self) -> int:
         return len(self.conv_results)
 
@@ -188,6 +244,14 @@ class ModelMetrics:
         else:
             return float("inf")
 
+    @property
+    def avg_memory_usages(self):
+        return [epoch_result.avg_memory_usage for epoch_result in self.epoch_results]
+
+    @property
+    def avg_data_rates(self):
+        return [epoch_result.avg_data_rate for epoch_result in self.epoch_results]
+
     # Generics #
     def __len__(self):
         return len(self.epoch_results)
@@ -218,6 +282,15 @@ def get_memory(device: str = DEVICE) -> Dict[str, float]:
             "resident": memory_info.rss / 1024**2,  # Resident Set Size in MB
             "virtual": memory_info.vms / 1024**2,  # Virtual Memory Size in MB
         }
+
+
+def get_used_memory(device: str = DEVICE) -> float:
+    mem_info = get_memory()
+
+    if device == "cuda":
+        return mem_info["allocated"]
+    else:
+        return mem_info["resident"]
 
 
 def print_update(**kwargs):
@@ -314,6 +387,23 @@ def process_model_metrics(metrics: Dict[str, ModelMetrics]):
     plt.xlabel("Packets per conversation")
     plt.ylabel("Conversation Time (s)")
     title = f"Overall Time vs Conversation length"
+    plt.title(title)
+    plt.show()
+
+    # Get the model memory usages
+    train_data_rates = [
+        epoch_result.avg_data_rate for epoch_result in train_metrics.epoch_results
+    ]
+    val_data_rates = [
+        epoch_result.avg_data_rate for epoch_result in val_metrics.epoch_results
+    ]
+    plt.plot(train_data_rates, label="Training")
+    plt.plot(val_data_rates, label="Validation")
+    # plt.xticks(np.arange(len(conv_lens)), conv_lens)
+    plt.legend()
+    plt.xlabel("Epoch")
+    plt.ylabel("Max Data Rate (bytes/second)")
+    title = f"Conversation Bytes Per Second vs Epoch"
     plt.title(title)
     plt.show()
 
@@ -550,7 +640,7 @@ class PacketItGenerator:
 
 ### File system helpers ###
 def pkl_write_model(
-    model,
+    model: nn.Module,
     metrics: Dict[str, ModelMetrics],
     save_dir: str,
     metadata: Dict = {},
@@ -595,7 +685,7 @@ def pkl_write_model(
     print(f"All model files saved to directory {save_dir}")
 
 
-def pkl_read_model(read_dir) -> Tuple[Any, Dict[str, ModelMetrics], Dict]:
+def pkl_read_model(read_dir) -> Tuple[nn.Module, Dict[str, ModelMetrics], Dict]:
     assert os.path.isdir(read_dir), f"E: The directory {read_dir} does not exist"
 
     model_path = None
@@ -604,7 +694,7 @@ def pkl_read_model(read_dir) -> Tuple[Any, Dict[str, ModelMetrics], Dict]:
             model_path = os.path.join(read_dir, path)
             break
 
-    model = None
+    model = nn.Module()
     if model_path is not None:
         with open(model_path, "rb") as f:
             model = pickle.load(f)
@@ -631,6 +721,36 @@ def get_git_hash() -> str:
     except Exception as e:
         print(f"E: Get git has failed with {e}")
         return ""
+
+
+def get_num_model_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def estimate_model_size(model: nn.Module) -> int:
+    """
+    @Description: Uses the number of parameters and buffers in a model
+    approximate the model's memory footprint
+
+    @Notes:
+
+    @Returns: model size in bytes
+    """
+    params_size = 0
+    for param in model.parameters():
+        params_size += param.nelement() * param.element_size()
+
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    total = params_size + buffer_size
+
+    print(
+        f"Model size:\n total size: {total}\n params size: {params_size}\n buffer size: {buffer_size}"
+    )
+
+    return total
 
 
 ### Custom loss functions ###

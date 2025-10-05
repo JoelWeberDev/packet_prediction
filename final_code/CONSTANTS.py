@@ -20,6 +20,7 @@ DEBUG_MODE = True
 SRC_IP_TAG = "ip.src"
 DST_IP_TAG = "ip.dst"
 PAYLOAD_TAG = "tcp.payload"
+RESULTS_DIR = "results/online_learning"
 
 IP_DICT = {
     "broker": "10.16.100.73",
@@ -71,7 +72,7 @@ O_MD_DROPOUT = 0.2
 O_MD_HIDDEN_DIM = 64
 
 # Packet representation size
-O_PACKET_REP_DIM = 128  # Experiment
+O_PACKET_REP_DIM = 32  # Experiment
 O_PACKET_EMB_LAYERS = 2  # Experiment
 O_PACKET_EMB_DROPOUT = 0.1
 
